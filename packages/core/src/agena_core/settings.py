@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     auto_sentry_import_enabled: bool = Field(default=True, alias='AUTO_SENTRY_IMPORT_ENABLED')
     auto_newrelic_import_enabled: bool = Field(default=True, alias='AUTO_NEWRELIC_IMPORT_ENABLED')
     auto_sentinel_enabled: bool = Field(default=True, alias='AUTO_SENTINEL_ENABLED')
+    # When a task's AI run opens a PR, automatically kick off an AI code
+    # review with the org's reviewer agent (no manual 🔎 click needed).
+    # Gated additionally on a reviewer agent actually being configured.
+    auto_review_after_pr_enabled: bool = Field(default=True, alias='AUTO_REVIEW_AFTER_PR_ENABLED')
 
     cors_allowed_origins: str = Field(
         default='https://agena.dev,https://*.agena.dev,http://localhost:3010,http://localhost:3011,http://localhost:3012',

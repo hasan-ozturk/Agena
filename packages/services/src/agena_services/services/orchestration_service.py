@@ -1794,6 +1794,18 @@ class OrchestrationService:
 
             await self.db_session.commit()
 
+            # Auto-review: once a PR is opened, kick off an AI code review
+            # with the org's reviewer agent so the human doesn't have to
+            # click 🔎 manually. No-op on revisions / when no reviewer is
+            # configured / when the feature flag is off.
+            await self._maybe_auto_review(
+                organization_id=organization_id,
+                task=task,
+                pr_url=pr_url,
+                assignment_id=assignment_id,
+                is_revision=bool(revision_id),
+            )
+
             # Auto-unblock: queue dependent tasks whose dependencies are now all completed
             await self._auto_queue_dependents(organization_id, task.id, task_service, create_pr, mode)
 
@@ -3138,6 +3150,73 @@ class OrchestrationService:
             playbook=entry.get('playbook') or entry.get('repo_playbook') or None,
             is_active=True,
         )
+
+    async def _resolve_auto_reviewer_role(self, task: TaskRecord) -> str | None:
+        """Pick the reviewer agent for an automatic post-PR review.
+
+        Agent configs (incl. the per-agent ``is_reviewer`` toggle) live in
+        the dashboard's user-preferences JSON, same as repo mappings. Return
+        the role of the first agent the task creator has flagged as a
+        reviewer; None when they have none configured (→ skip auto-review).
+        """
+        from agena_models.models.user_preference import UserPreference
+
+        user_id = getattr(task, 'created_by_user_id', None)
+        if not user_id:
+            return None
+        pref = (await self.db_session.execute(
+            select(UserPreference).where(UserPreference.user_id == user_id)
+        )).scalar_one_or_none()
+        if not pref or not pref.agents_json:
+            return None
+        try:
+            import json as _json
+            agents = _json.loads(pref.agents_json)
+        except Exception:
+            return None
+        if not isinstance(agents, list):
+            return None
+        for a in agents:
+            if isinstance(a, dict) and a.get('is_reviewer') and a.get('enabled', True) and a.get('role'):
+                return str(a['role'])
+        return None
+
+    async def _maybe_auto_review(
+        self,
+        *,
+        organization_id: int,
+        task: TaskRecord,
+        pr_url: str | None,
+        assignment_id: int | None,
+        is_revision: bool,
+    ) -> None:
+        """Fire an AI code review automatically once a fresh PR is opened.
+
+        Best-effort: any failure here is logged and swallowed so it never
+        affects the task's completed/PR status. Skips revision runs (the
+        PR was already reviewed) and runs only when a reviewer agent is
+        configured and the feature flag is on.
+        """
+        try:
+            if is_revision or not (pr_url or '').strip():
+                return
+            if not self.settings.auto_review_after_pr_enabled:
+                return
+            reviewer_role = await self._resolve_auto_reviewer_role(task)
+            if not reviewer_role:
+                return
+            from agena_services.services.review_service import trigger_review
+            await trigger_review(
+                self.db_session,
+                organization_id=organization_id,
+                task_id=int(task.id),
+                requested_by_user_id=int(getattr(task, 'created_by_user_id', 0) or 0),
+                reviewer_agent_role=reviewer_role,
+                assignment_id=assignment_id,
+            )
+            logger.info('Auto-review queued for task %s with reviewer %s', task.id, reviewer_role)
+        except Exception as exc:
+            logger.warning('Auto-review dispatch skipped for task %s: %s', task.id, exc)
 
     def _extract_task_routing(self, task: TaskRecord, repo_mapping: 'RepoMapping | None' = None) -> TaskRouting:
         meta: dict[str, str] = {}
