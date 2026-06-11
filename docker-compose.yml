@@ -107,6 +107,11 @@ services:
     env_file:
       - frontend/.env.example
       - frontend/.env.local
+    environment:
+      # The source is a Windows bind mount; inotify events don't reach the
+      # Linux container, so Next.js never hot-reloads edits. Poll instead.
+      - WATCHPACK_POLLING=true
+      - CHOKIDAR_USEPOLLING=true
     ports:
       - '3010:3010'
     volumes:

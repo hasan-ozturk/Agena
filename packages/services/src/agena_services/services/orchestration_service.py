@@ -1518,6 +1518,7 @@ class OrchestrationService:
                     remote_url=_remote_url,
                     remote_pat=_remote_pat,
                     is_revision=bool(revision_id),
+                    push=_should_push,
                 )
                 if not has_changes:
                     await task_service.add_log(task.id, organization_id, 'local_exec', 'No file changes detected, skipping PR')

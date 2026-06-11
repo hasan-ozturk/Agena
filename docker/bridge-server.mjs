@@ -30,14 +30,32 @@ console.log(`  claude: ${claudeBin || 'NOT FOUND'}`);
 // Track active stream processes by repo_path for cancellation
 const activeStreams = new Map(); // repo_path → { proc, cli }
 
+// The host mounts its live ~/.claude read-only here. Claude on the host
+// auto-refreshes its OAuth token roughly hourly, so a copy taken once at
+// container start goes stale and the CLI starts returning 401. Re-pull the
+// host credentials before every run so the container always uses the
+// freshest token.
+const HOST_CLAUDE = '/host-claude';
+
+function refreshClaudeCreds() {
+  try {
+    const src = `${HOST_CLAUDE}/.credentials.json`;
+    if (existsSync(src)) {
+      mkdirSync(`${HOME}/.claude`, { recursive: true });
+      writeFileSync(`${HOME}/.claude/.credentials.json`, readFileSync(src, 'utf8'));
+    }
+  } catch {}
+  // Keep the env var in sync with whatever token is current on disk.
+  try {
+    const cred = JSON.parse(readFileSync(`${HOME}/.claude/.credentials.json`, 'utf8'));
+    if (cred.claudeAiOauth?.accessToken) {
+      process.env.ANTHROPIC_API_KEY = cred.claudeAiOauth.accessToken;
+    }
+  } catch {}
+}
+
 // Load saved API key from credentials file on startup (persists across container restarts)
-try {
-  const cred = JSON.parse(readFileSync(`${HOME}/.claude/.credentials.json`, 'utf8'));
-  if (cred.claudeAiOauth?.accessToken && !process.env.ANTHROPIC_API_KEY) {
-    process.env.ANTHROPIC_API_KEY = cred.claudeAiOauth.accessToken;
-    console.log('  claude: loaded API key from credentials file');
-  }
-} catch {}
+refreshClaudeCreds();
 
 async function detectClaudeAuth() {
   if (!claudeBin) return false;
@@ -238,9 +256,11 @@ const server = createServer(async (req, res) => {
   } else if (url.pathname === '/codex') {
     result = await runCLI(codexBin, 'codex', data);
   } else if (url.pathname === '/claude/stream') {
+    refreshClaudeCreds();
     await runCLIStream(claudeBin, 'claude', data, res);
     return;
   } else if (url.pathname === '/claude') {
+    refreshClaudeCreds();
     result = await runCLI(claudeBin, 'claude', data);
   } else if (url.pathname === '/codex/auth') {
     result = await setAuth('codex', data);

@@ -23,6 +23,7 @@ class LocalRepoService:
         remote_url: str | None = None,
         remote_pat: str | None = None,
         is_revision: bool = False,
+        push: bool = True,
     ) -> tuple[bool, str]:
         root = Path(repo_path).expanduser().resolve()
         if not root.exists() or not root.is_dir():
@@ -115,6 +116,15 @@ class LocalRepoService:
                 ['-c', 'user.name=AI Agent', '-c', 'user.email=ai-agent@local',
                  'commit', '-m', commit_message],
             )
+
+            # When the caller doesn't want a remote push (create_pr=False
+            # and not a revision), stop after the local commit. The diff
+            # preview reads HEAD~..HEAD locally, so the run is still
+            # useful — and we avoid pushing to an unauthenticated `origin`
+            # (no PAT was passed), which used to crash the worker with
+            # "could not read Username for https://dev.azure.com".
+            if not push:
+                return True, branch_name
 
             # Push. For revisions a normal fast-forward is what we want
             # (we built on top of the remote tip). For fresh PRs we

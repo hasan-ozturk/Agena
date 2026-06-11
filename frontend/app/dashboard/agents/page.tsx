@@ -282,6 +282,7 @@ function loadAgents(defaults: AgentConfig[], t: ReturnType<typeof useLocale>['t'
         enabled: p.enabled ?? true,
         palette: p.palette ?? 0,
         create_pr: p.create_pr ?? false,
+        is_reviewer: p.is_reviewer ?? false,
       }));
     return [...mergedDefaults, ...extras];
   } catch {
