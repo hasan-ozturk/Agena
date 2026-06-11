@@ -3059,12 +3059,85 @@ class OrchestrationService:
 
         # Single-repo: resolve from task
         mapping_id = getattr(task, 'repo_mapping_id', None)
-        if not mapping_id:
+        if mapping_id:
+            mapping = await self.db_session.get(RepoMapping, mapping_id)
+            if mapping and mapping.organization_id == task.organization_id and mapping.is_active:
+                return mapping
+
+        # Fallback: the dashboard stores repo mappings in the user's
+        # preferences JSON (NOT the RepoMapping table), and UI-assigned
+        # tasks carry only a ``Local Repo Mapping: <name>`` line in their
+        # description — no repo_mapping_id, no assignment. Without this the
+        # mapping resolves to None, the authenticated Azure remote URL never
+        # gets built, and the push falls back to a credential-less ``origin``
+        # ("could not read Username for https://dev.azure.com"). Resolve the
+        # mapping from the task creator's prefs by name so the same flow works.
+        return await self._resolve_mapping_from_prefs(task)
+
+    async def _resolve_mapping_from_prefs(self, task: TaskRecord) -> 'RepoMapping | None':
+        """Build a detached RepoMapping from the creator's preferences JSON."""
+        from agena_models.models.repo_mapping import RepoMapping
+        from agena_models.models.user_preference import UserPreference
+
+        # Mapping name from the task's ``Local Repo Mapping: <name>`` line.
+        wanted_name: str | None = None
+        for raw in (task.description or '').splitlines():
+            if ':' not in raw:
+                continue
+            key, value = raw.split(':', 1)
+            if key.strip().lower() == 'local repo mapping':
+                wanted_name = value.strip()
+                break
+        if not wanted_name:
             return None
-        mapping = await self.db_session.get(RepoMapping, mapping_id)
-        if mapping and mapping.organization_id == task.organization_id and mapping.is_active:
-            return mapping
-        return None
+
+        user_id = getattr(task, 'created_by_user_id', None)
+        if not user_id:
+            return None
+        pref = (await self.db_session.execute(
+            select(UserPreference).where(UserPreference.user_id == user_id)
+        )).scalar_one_or_none()
+        if not pref or not pref.repo_mappings_json:
+            return None
+        try:
+            import json as _json
+            mappings = _json.loads(pref.repo_mappings_json)
+        except Exception:
+            return None
+        if not isinstance(mappings, list):
+            return None
+
+        entry = next((m for m in mappings if isinstance(m, dict) and m.get('name') == wanted_name), None)
+        if not entry:
+            return None
+
+        provider = (entry.get('provider') or '').strip().lower()
+        # Prefs schema differs from the ORM: Azure stores the project in
+        # ``azure_project`` and the repo in ``azure_repo_name``; the branch
+        # is ``default_branch``. Map onto the ORM attribute names that the
+        # downstream routing/URL-construction code reads.
+        if provider == 'azure':
+            owner = entry.get('azure_project') or entry.get('owner')
+            repo_name = entry.get('azure_repo_name') or entry.get('repo_name')
+        else:
+            owner = entry.get('owner') or entry.get('github_owner')
+            repo_name = entry.get('repo_name') or entry.get('github_repo')
+        if not owner or not repo_name:
+            return None
+
+        base_branch = (entry.get('default_branch') or entry.get('base_branch') or '').strip() or 'main'
+        # Detached instance — NOT added to the session; used only for its
+        # attributes by the routing/PR code.
+        return RepoMapping(
+            organization_id=task.organization_id,
+            provider=provider or 'azure',
+            owner=str(owner),
+            repo_name=str(repo_name),
+            base_branch=base_branch,
+            local_repo_path=entry.get('local_path') or None,
+            playbook=entry.get('playbook') or entry.get('repo_playbook') or None,
+            is_active=True,
+        )
 
     def _extract_task_routing(self, task: TaskRecord, repo_mapping: 'RepoMapping | None' = None) -> TaskRouting:
         meta: dict[str, str] = {}
