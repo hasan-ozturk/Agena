@@ -272,7 +272,13 @@ class OrchestrationService:
             try:
                 az_cfg = await IntegrationConfigService(self.db_session).get_config(organization_id, 'azure')
                 if az_cfg and az_cfg.base_url:
-                    routing.azure_repo_url = f'{az_cfg.base_url.rstrip("/")}/{repo_mapping.owner}/_git/{repo_mapping.repo_name}'
+                    # URL-encode the project segment so Azure projects with
+                    # spaces (e.g. "YESIMTECH PROJECT") produce a valid git
+                    # remote URL. Normalize first (unquote→quote) so a value
+                    # that is already encoded doesn't get double-encoded.
+                    from urllib.parse import quote as _q, unquote as _uq
+                    _owner_seg = _q(_uq(repo_mapping.owner), safe='')
+                    routing.azure_repo_url = f'{az_cfg.base_url.rstrip("/")}/{_owner_seg}/_git/{repo_mapping.repo_name}'
                     routing.azure_project = repo_mapping.owner
                     logger.info('Constructed azure_repo_url=%s project=%s', routing.azure_repo_url, routing.azure_project)
                 else:
@@ -551,6 +557,18 @@ class OrchestrationService:
                     _cli_base_ref: str | None = None
                     if revision_id and revision_assignment and revision_assignment.branch_name:
                         _cli_base_ref = revision_assignment.branch_name
+                    # Authenticated remote so the per-task worktree can fetch
+                    # the LATEST base before the agent starts (fresh, isolated
+                    # workspace — industry-standard). Best-effort; on any miss
+                    # the worktree falls back to the existing checkout.
+                    _cli_remote_url = routing.azure_repo_url if routing.effective_source == 'azure' else None
+                    _cli_remote_pat = None
+                    if _cli_remote_url:
+                        try:
+                            _az_cfg = await IntegrationConfigService(self.db_session).get_config(organization_id, 'azure')
+                            _cli_remote_pat = _az_cfg.secret if _az_cfg and _az_cfg.secret else None
+                        except Exception:
+                            _cli_remote_pat = None
                     final_code = await self.claude_cli_service.generate_file_markdown(
                         repo_path=routing.local_repo_path,
                         task_title=task.title,
@@ -559,6 +577,8 @@ class OrchestrationService:
                         log_callback=_cli_log,
                         task_id=str(task.id),
                         base_ref=_cli_base_ref,
+                        remote_url=_cli_remote_url,
+                        remote_pat=_cli_remote_pat,
                         candidate_files=candidate_files,
                     )
                     parsed_blocks = self._parse_reviewed_output_to_files(final_code, local_repo_path=routing.local_repo_path)
@@ -1419,7 +1439,7 @@ class OrchestrationService:
                     ],
                 )
             else:
-                pr_payload = await self._build_pr_payload(task=payload, reviewed_code=final_code, local_repo_path=routing.local_repo_path)
+                pr_payload = await self._build_pr_payload(task=payload, reviewed_code=final_code, local_repo_path=routing.local_repo_path, base_branch_hint=(repo_mapping.base_branch if repo_mapping else None))
             try:
                 await task_service.add_log(
                     task.id,
@@ -2269,7 +2289,7 @@ class OrchestrationService:
                 return ext
         return None
 
-    async def _build_pr_payload(self, task: dict[str, Any], reviewed_code: str, local_repo_path: str | None = None) -> CreatePRRequest:
+    async def _build_pr_payload(self, task: dict[str, Any], reviewed_code: str, local_repo_path: str | None = None, base_branch_hint: str | None = None) -> CreatePRRequest:
         # Build branch name from pattern (user configurable via profile settings)
         title = str(task.get('title', '') or '')
         desc = str(task.get('description', '') or '')
@@ -2364,17 +2384,23 @@ class OrchestrationService:
         # so they can override the default `[AI] {ab} {title}` shape
         # without us redeploying. _resolve_user_pr_title_template returns
         # None on missing / blank → _format_pr_title uses its default.
-        # For a mapped LOCAL repo, the PR base must be that clone's real
-        # default branch (Azure repos are often on 'master'). The global
-        # github_default_base_branch ('main') is wrong for such repos: the
-        # later `git fetch <base>` + `checkout -B <branch> <base>` then fails
-        # ('main' is not a commit), and with allow_fail it silently lands the
-        # commit on the current branch so the push 404s on a missing refspec.
+        # Resolve the PR base branch. The mapping's own branch field is the
+        # user's explicit choice and wins — but only when it actually exists
+        # in the clone (the Repo Mappings UI defaults that field to 'main',
+        # which is wrong for 'master' repos and would silently break the push
+        # via a "'main' is not a commit" checkout that allow_fail hides).
+        # Otherwise fall back to the clone's real default branch, then the
+        # global github_default_base_branch setting.
         base_branch = self.settings.github_default_base_branch
         if local_repo_path:
             _detected = self._detect_local_base_branch(local_repo_path)
             if _detected:
                 base_branch = _detected
+            _hint = (base_branch_hint or '').strip()
+            if _hint and _hint != base_branch and self._local_branch_exists(local_repo_path, _hint):
+                base_branch = _hint
+        elif (base_branch_hint or '').strip():
+            base_branch = base_branch_hint.strip()
 
         _user_id_for_tpl = int(task.get('created_by_user_id') or 0)
         _pr_tpl = await _resolve_user_pr_title_template(self.db_session, _user_id_for_tpl)
@@ -2430,6 +2456,25 @@ class OrchestrationService:
         except Exception:
             pass
         return None
+
+    def _local_branch_exists(self, local_repo_path: str, branch: str) -> bool:
+        """True if `branch` exists in the clone (as origin/<branch> or local)."""
+        import subprocess
+        repo = Path(local_repo_path).expanduser().resolve()
+        if not (repo / '.git').exists() or not branch:
+            return False
+        env = {**__import__('os').environ, 'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'safe.directory', 'GIT_CONFIG_VALUE_0': str(repo)}
+        for ref in (f'refs/remotes/origin/{branch}', f'refs/heads/{branch}'):
+            try:
+                r = subprocess.run(
+                    ['git', 'rev-parse', '--verify', '--quiet', ref],
+                    cwd=str(repo), capture_output=True, text=True, timeout=10, env=env,
+                )
+                if r.returncode == 0 and (r.stdout or '').strip():
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _extract_cli_auth_error(self, text: str) -> str | None:
         low = (text or '').lower()

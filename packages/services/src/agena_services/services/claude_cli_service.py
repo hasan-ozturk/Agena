@@ -33,53 +33,105 @@ class ClaudeCLIService:
 
     # ── Worktree helpers ─────────────────────────────────────────────────
     @staticmethod
+    def _auth_remote_url(remote_url: str | None, remote_pat: str | None) -> str:
+        """Embed a PAT into an https remote URL for non-interactive fetch.
+
+        Returns 'origin' when no URL is given, or the URL unchanged when no
+        PAT is given (so SSH/credential-helper setups still work).
+        """
+        if not remote_url:
+            return 'origin'
+        if not remote_pat:
+            return remote_url
+        from urllib.parse import quote, urlparse, urlunparse
+        p = urlparse(remote_url)
+        if p.scheme not in {'http', 'https'} or not p.netloc:
+            return remote_url
+        host = p.hostname or p.netloc
+        if p.port:
+            host = f'{host}:{p.port}'
+        netloc = f'{quote(p.username or "pat", safe="")}:{quote(remote_pat, safe="")}@{host}'
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+
+    @staticmethod
     def _create_worktree(
         repo_path: str,
         task_id: str = '',
         *,
         base_ref: str | None = None,
+        remote_url: str | None = None,
+        remote_pat: str | None = None,
     ) -> str | None:
-        """Create a git worktree so each task works on a clean copy.
+        """Create an isolated git worktree based on the LATEST remote base so
+        each task starts from current HEAD — the industry-standard ephemeral
+        workspace (Copilot/OpenHands clone fresh per task). It fetches the
+        base from the authenticated remote, then adds a DETACHED worktree off
+        the freshly-fetched commit. Detached avoids colliding with the base
+        branch already checked out in the main repo (the old code did
+        `worktree add <wt> master`, which always failed when master was
+        checked out, so the agent silently fell back to a stale shared repo).
 
-        `base_ref` controls which ref the worktree branches from:
-          - None   → origin/HEAD (main / master). Default for fresh runs.
-          - <name> → origin/<name>. Used by the /tasks/{id}/revise flow
-                     so the worker re-checks-out the existing feature
-                     branch and pushes an additional commit, instead of
-                     starting from main and producing a NEW branch.
+        All failures degrade safely: fresh fetch → existing tracking ref →
+        local base → None (caller then runs in the main repo, the previous
+        behaviour) so this can never make a working run worse.
+
+        base_ref:
+          - None   → fresh run, base = origin/HEAD (master/main), fetched fresh
+          - <name> → revision run, base = that existing feature branch
         """
         repo = Path(repo_path).expanduser().resolve()
         if not (repo / '.git').exists():
             return None
         wt_name = f'.worktree-agena-{task_id or uuid.uuid4().hex[:8]}'
         wt_path = repo.parent / wt_name
+        env = {
+            **__import__('os').environ,
+            'GIT_TERMINAL_PROMPT': '0',
+            'GIT_CONFIG_COUNT': '1',
+            'GIT_CONFIG_KEY_0': 'safe.directory',
+            'GIT_CONFIG_VALUE_0': str(repo),
+        }
+        # Never reuse a worktree from a previous run — it would pin the agent
+        # to yesterday's base. Always recreate clean.
         if wt_path.exists():
-            # Reuse existing worktree
-            return str(wt_path)
+            try:
+                subprocess.run(['git', 'worktree', 'remove', '--force', str(wt_path)],
+                               cwd=str(repo), capture_output=True, text=True, timeout=30, env=env)
+            except Exception:
+                pass
+            try:
+                import shutil as _sh
+                if wt_path.exists():
+                    _sh.rmtree(str(wt_path), ignore_errors=True)
+            except Exception:
+                pass
+        auth = ClaudeCLIService._auth_remote_url(remote_url, remote_pat)
         try:
             if base_ref:
-                # Revision flow: pull the latest copy of the existing
-                # feature branch before basing the worktree on it so we
-                # don't push stale tips and trigger force-push surprises.
-                subprocess.run(
-                    ['git', 'fetch', 'origin', base_ref],
-                    cwd=str(repo), capture_output=True, text=True, timeout=30,
-                )
-                subprocess.run(
-                    ['git', 'worktree', 'add', str(wt_path), f'origin/{base_ref}'],
-                    cwd=str(repo), capture_output=True, text=True, timeout=30,
-                    check=True,
-                )
+                # Revision flow: base off the existing feature branch's latest tip.
+                subprocess.run(['git', 'fetch', auth, base_ref],
+                               cwd=str(repo), capture_output=True, text=True, timeout=60, env=env)
+                subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), 'FETCH_HEAD'],
+                               cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
             else:
                 base = subprocess.run(
                     ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
-                    cwd=str(repo), capture_output=True, text=True, timeout=10,
+                    cwd=str(repo), capture_output=True, text=True, timeout=10, env=env,
                 ).stdout.strip().replace('refs/remotes/origin/', '') or 'main'
-                subprocess.run(
-                    ['git', 'worktree', 'add', str(wt_path), base],
-                    cwd=str(repo), capture_output=True, text=True, timeout=30,
-                    check=True,
-                )
+                fetched = False
+                try:
+                    r = subprocess.run(['git', 'fetch', auth, base],
+                                       cwd=str(repo), capture_output=True, text=True, timeout=60, env=env)
+                    fetched = (r.returncode == 0)
+                except Exception:
+                    fetched = False
+                start_ref = 'FETCH_HEAD' if fetched else f'origin/{base}'
+                try:
+                    subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), start_ref],
+                                   cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
+                except Exception:
+                    subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), base],
+                                   cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
             return str(wt_path)
         except Exception:
             return None
@@ -105,6 +157,8 @@ class ClaudeCLIService:
         log_callback: LogCallback | None = None,
         task_id: str = '',
         base_ref: str | None = None,
+        remote_url: str | None = None,
+        remote_pat: str | None = None,
         candidate_files: list[str] | None = None,
     ) -> str:
         candidate_section = ''
@@ -152,7 +206,7 @@ class ClaudeCLIService:
         # revision runs `base_ref` is the existing feature branch so
         # we land an additional commit on the same PR instead of
         # branching from main again.
-        wt_path = self._create_worktree(repo_path, task_id, base_ref=base_ref)
+        wt_path = self._create_worktree(repo_path, task_id, base_ref=base_ref, remote_url=remote_url, remote_pat=remote_pat)
         effective_path = wt_path or repo_path
         if wt_path and log_callback:
             await log_callback(f'Worktree created: {wt_path}')
