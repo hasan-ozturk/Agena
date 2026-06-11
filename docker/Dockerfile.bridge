@@ -1,0 +1,20 @@
+# CLI Bridge container — runs the Claude Code CLI inside Docker so the
+# AI pipeline works on hosts where the CLI can't run natively (Windows).
+# Auth is provided by mounting the host's ~/.claude credentials read-only;
+# the entrypoint copies them into the container's HOME on startup.
+FROM node:20-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates curl util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Claude Code CLI (provides `claude` on PATH, runs on Linux).
+RUN npm install -g @anthropic-ai/claude-code
+
+WORKDIR /app
+COPY docker/bridge-server.mjs /app/bridge-server.mjs
+COPY docker/bridge-entrypoint.sh /app/bridge-entrypoint.sh
+RUN chmod +x /app/bridge-entrypoint.sh
+
+EXPOSE 9876
+ENTRYPOINT ["/app/bridge-entrypoint.sh"]

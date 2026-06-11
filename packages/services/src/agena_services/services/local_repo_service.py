@@ -36,6 +36,16 @@ class LocalRepoService:
         # sees a clean working tree.
         await self._run_git(root, ['stash', '--include-untracked'], allow_fail=True)
 
+        # CLI agents (Claude/Codex) run with full tool access and can leave
+        # the working tree in a half-merged / unmerged-index state from their
+        # own git use. `git stash` then no-ops and the later `checkout -B`
+        # fails with "resolve your current index first" — but allow_fail
+        # swallows it, so the commit lands on the wrong branch and the push
+        # 404s on a missing refspec. Force a clean slate before branching.
+        # Safe: the file contents to apply are already held in `files`.
+        await self._run_git(root, ['merge', '--abort'], allow_fail=True)
+        await self._run_git(root, ['reset', '--hard', 'HEAD'], allow_fail=True)
+
         # Save current branch to restore later
         original_branch = (await self._run_git(root, ['rev-parse', '--abbrev-ref', 'HEAD'])).strip()
 

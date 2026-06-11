@@ -9,7 +9,7 @@ services:
     env_file:
       - .env
     environment:
-      - CLI_BRIDGE_URL=http://host.docker.internal:9876
+      - CLI_BRIDGE_URL=http://cli-bridge:9876
       - ATTACHMENT_HOST_ROOT=${ATTACHMENT_HOST_ROOT:-}
     ports:
       - '8010:8010'
@@ -17,14 +17,15 @@ services:
       - ./packages:/app/packages
       - ./alembic:/app/alembic
       - ./data:/app/data
-      - ${HOST_REPO_ROOT:-/Users}:${HOST_REPO_ROOT:-/Users}
-      # Read-only host SSH mount so in-container git can resolve
-      # SSH alias forms (e.g. "git@github.com-<profile>:owner/repo.git")
-      # via ~/.ssh/config and authenticate with the matching key.
-      - ${HOME}/.ssh:/root/.ssh:ro
+      # NOTE: Windows local-dev — host repo mount and ~/.ssh mount removed.
+      # They are only needed for the AI pipeline (cloning local repos + git
+      # SSH auth), which the core stack does not exercise. Re-add for full AI.
       # Persist fastembed model cache across container recreates so the
       # ~120MB MiniLM download only happens once on this machine.
       - fastembed_cache:/root/.cache/fastembed
+      # Shared repo workspace — same path is mounted into cli-bridge so
+      # Claude (in the bridge) and the worker see the same checkout.
+      - agena_repos:/workspace
     # NOTE: alembic upgrade head runs on every (re)start. The migrations
     # are written to be idempotent (each one guards CREATE TABLE / ADD
     # COLUMN with an inspect() check), so this is safe to repeat. We
@@ -52,20 +53,20 @@ services:
     env_file:
       - .env
     environment:
-      - CLI_BRIDGE_URL=http://host.docker.internal:9876
+      - CLI_BRIDGE_URL=http://cli-bridge:9876
       - ATTACHMENT_HOST_ROOT=${ATTACHMENT_HOST_ROOT:-}
     volumes:
       - ./packages:/app/packages
       - ./alembic:/app/alembic
       - ./data:/app/data
-      - ${HOST_REPO_ROOT:-/Users}:${HOST_REPO_ROOT:-/Users}
-      # Read-only host SSH mount so in-container git can resolve
-      # SSH alias forms (e.g. "git@github.com-<profile>:owner/repo.git")
-      # via ~/.ssh/config and authenticate with the matching key.
-      - ${HOME}/.ssh:/root/.ssh:ro
+      # NOTE: Windows local-dev — host repo mount and ~/.ssh mount removed
+      # (only needed for the full AI pipeline). See backend service above.
       # Persist fastembed model cache across container recreates so the
       # ~120MB MiniLM download only happens once on this machine.
       - fastembed_cache:/root/.cache/fastembed
+      # Shared repo workspace — same path is mounted into cli-bridge so
+      # Claude (in the bridge) and the worker see the same checkout.
+      - agena_repos:/workspace
     command: >
       bash -c "pip install -q -e packages/core -e packages/models -e packages/services
       -e packages/agents -e packages/api -e packages/worker
@@ -76,8 +77,27 @@ services:
       - qdrant
     restart: unless-stopped
 
-  # CLI bridge runs on host via ./start.sh (node docker/bridge-server.mjs)
-  # so it can access host's claude/codex CLI auth (macOS Keychain).
+  # CLI bridge — containerized for Windows (host CLIs don't run on win32).
+  # Runs Claude Code inside Docker; auth comes from the host ~/.claude
+  # credentials mounted read-only and copied in by the entrypoint.
+  cli-bridge:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.bridge
+    container_name: ai_agent_cli_bridge
+    environment:
+      - AGENA_BACKEND_URL=http://backend:8010
+      # Allow Claude Code's --dangerously-skip-permissions while running as
+      # root inside the container (it otherwise refuses for root/sudo).
+      - IS_SANDBOX=1
+    volumes:
+      # Host Claude credentials (read-only) — entrypoint copies them in.
+      - "${HOST_CLAUDE_DIR:-C:/Users/hasan.ozturk/.claude}:/host-claude:ro"
+      # Shared repo workspace — same mount/path as backend & worker.
+      - agena_repos:/workspace
+    expose:
+      - '9876'
+    restart: unless-stopped
 
   frontend:
     build:
@@ -163,3 +183,4 @@ volumes:
   mysql_data:
   qdrant_data:
   fastembed_cache:
+  agena_repos:

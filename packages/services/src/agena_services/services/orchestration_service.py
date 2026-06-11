@@ -2364,6 +2364,18 @@ class OrchestrationService:
         # so they can override the default `[AI] {ab} {title}` shape
         # without us redeploying. _resolve_user_pr_title_template returns
         # None on missing / blank → _format_pr_title uses its default.
+        # For a mapped LOCAL repo, the PR base must be that clone's real
+        # default branch (Azure repos are often on 'master'). The global
+        # github_default_base_branch ('main') is wrong for such repos: the
+        # later `git fetch <base>` + `checkout -B <branch> <base>` then fails
+        # ('main' is not a commit), and with allow_fail it silently lands the
+        # commit on the current branch so the push 404s on a missing refspec.
+        base_branch = self.settings.github_default_base_branch
+        if local_repo_path:
+            _detected = self._detect_local_base_branch(local_repo_path)
+            if _detected:
+                base_branch = _detected
+
         _user_id_for_tpl = int(task.get('created_by_user_id') or 0)
         _pr_tpl = await _resolve_user_pr_title_template(self.db_session, _user_id_for_tpl)
         return CreatePRRequest(
@@ -2380,10 +2392,44 @@ class OrchestrationService:
                 f"Source: {task.get('source', 'unknown')}\n"
                 f"Task ID: {task.get('id', '')}"
             ),
-            base_branch=self.settings.github_default_base_branch,
+            base_branch=base_branch,
             commit_message=f"feat(ai): implement task {task.get('id', '')}",
             files=parsed_files,
         )
+
+    def _detect_local_base_branch(self, local_repo_path: str) -> str | None:
+        """Real default branch of a local clone ('master' vs 'main').
+
+        Used as the PR base for mapped local repos so we don't assume the
+        global GitHub default. Prefers the remote HEAD symref, falls back to
+        the currently checked-out branch.
+        """
+        import subprocess
+        repo = Path(local_repo_path).expanduser().resolve()
+        if not (repo / '.git').exists():
+            return None
+        env = {**__import__('os').environ, 'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'safe.directory', 'GIT_CONFIG_VALUE_0': str(repo)}
+        try:
+            r = subprocess.run(
+                ['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+                cwd=str(repo), capture_output=True, text=True, timeout=10, env=env,
+            )
+            ref = (r.stdout or '').strip()
+            if ref.startswith('origin/'):
+                return ref[len('origin/'):]
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                cwd=str(repo), capture_output=True, text=True, timeout=10, env=env,
+            )
+            b = (r.stdout or '').strip()
+            if b and b != 'HEAD':
+                return b
+        except Exception:
+            pass
+        return None
 
     def _extract_cli_auth_error(self, text: str) -> str | None:
         low = (text or '').lower()
