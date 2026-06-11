@@ -565,6 +565,8 @@ class OrchestrationService:
                         # bare skeleton — the root cause of hallucinated files
                         # and "feature already implemented" false negatives.
                         _cli_base_ref = repo_mapping.base_branch.strip()
+                    logger.info('claude_cli worktree base_ref=%s (repo_mapping=%s)',
+                                _cli_base_ref, getattr(repo_mapping, 'base_branch', None))
                     # Authenticated remote so the per-task worktree can fetch
                     # the LATEST base before the agent starts (fresh, isolated
                     # workspace — industry-standard). Best-effort; on any miss

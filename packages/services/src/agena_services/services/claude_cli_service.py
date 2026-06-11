@@ -106,35 +106,40 @@ class ClaudeCLIService:
             except Exception:
                 pass
         auth = ClaudeCLIService._auth_remote_url(remote_url, remote_pat)
+        # Resolve the base branch: an explicit base_ref (the mapping's branch
+        # on normal runs, or the feature branch on revisions) wins; otherwise
+        # fall back to the remote's default branch.
+        if base_ref:
+            base = base_ref
+        else:
+            base = subprocess.run(
+                ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+                cwd=str(repo), capture_output=True, text=True, timeout=10, env=env,
+            ).stdout.strip().replace('refs/remotes/origin/', '') or 'main'
+
+        fetched = False
         try:
-            if base_ref:
-                # Revision flow: base off the existing feature branch's latest tip.
-                subprocess.run(['git', 'fetch', auth, base_ref],
+            r = subprocess.run(['git', 'fetch', auth, base],
                                cwd=str(repo), capture_output=True, text=True, timeout=60, env=env)
-                subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), 'FETCH_HEAD'],
-                               cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
-            else:
-                base = subprocess.run(
-                    ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
-                    cwd=str(repo), capture_output=True, text=True, timeout=10, env=env,
-                ).stdout.strip().replace('refs/remotes/origin/', '') or 'main'
-                fetched = False
-                try:
-                    r = subprocess.run(['git', 'fetch', auth, base],
-                                       cwd=str(repo), capture_output=True, text=True, timeout=60, env=env)
-                    fetched = (r.returncode == 0)
-                except Exception:
-                    fetched = False
-                start_ref = 'FETCH_HEAD' if fetched else f'origin/{base}'
-                try:
-                    subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), start_ref],
-                                   cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
-                except Exception:
-                    subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), base],
-                                   cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
-            return str(wt_path)
+            fetched = (r.returncode == 0)
         except Exception:
-            return None
+            fetched = False
+
+        # Prefer the freshly-fetched tip, but fall back to the existing
+        # remote-tracking ref (origin/<base>) and then the local branch.
+        # NEVER blindly use FETCH_HEAD when the fetch failed — a stale
+        # FETCH_HEAD from an earlier (default-branch) fetch was pinning the
+        # worktree to master's bare initial commit, so the agent ran against
+        # an empty skeleton and hallucinated / saw the feature as "missing".
+        candidates = (['FETCH_HEAD'] if fetched else []) + [f'origin/{base}', base]
+        for ref in candidates:
+            try:
+                subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), ref],
+                               cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
+                return str(wt_path)
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _remove_worktree(repo_path: str, wt_path: str) -> None:
@@ -209,7 +214,14 @@ class ClaudeCLIService:
         wt_path = self._create_worktree(repo_path, task_id, base_ref=base_ref, remote_url=remote_url, remote_pat=remote_pat)
         effective_path = wt_path or repo_path
         if wt_path and log_callback:
-            await log_callback(f'Worktree created: {wt_path}')
+            try:
+                _head = subprocess.run(
+                    ['git', '-C', wt_path, 'log', '--oneline', '-1'],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+            except Exception:
+                _head = '?'
+            await log_callback(f'Worktree created off base_ref={base_ref or "(remote default)"} @ {_head}')
 
         # Store worktree info so orchestration_service can find the right path
         self.last_worktree_path = wt_path
