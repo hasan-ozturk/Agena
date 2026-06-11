@@ -557,6 +557,14 @@ class OrchestrationService:
                     _cli_base_ref: str | None = None
                     if revision_id and revision_assignment and revision_assignment.branch_name:
                         _cli_base_ref = revision_assignment.branch_name
+                    elif repo_mapping and (repo_mapping.base_branch or '').strip():
+                        # Normal run: base the agent's worktree on the mapping's
+                        # configured branch (e.g. nopaperv3) so it sees the REAL
+                        # code. Without this, _create_worktree falls back to
+                        # origin/HEAD (= master) and the agent works against the
+                        # bare skeleton — the root cause of hallucinated files
+                        # and "feature already implemented" false negatives.
+                        _cli_base_ref = repo_mapping.base_branch.strip()
                     # Authenticated remote so the per-task worktree can fetch
                     # the LATEST base before the agent starts (fresh, isolated
                     # workspace — industry-standard). Best-effort; on any miss
