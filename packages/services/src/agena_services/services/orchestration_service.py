@@ -3194,8 +3194,11 @@ class OrchestrationService:
 
         Agent configs (incl. the per-agent ``is_reviewer`` toggle) live in
         the dashboard's user-preferences JSON, same as repo mappings. Return
-        the role of the first agent the task creator has flagged as a
-        reviewer; None when they have none configured (→ skip auto-review).
+        Prefer a CLI-backed reviewer (claude_cli / codex_cli) because those
+        run through the local bridge and need no API key. A plain reviewer
+        like the built-in 'qa' defaults to OpenAI, which fails with "openai
+        integration is not configured" on orgs that only use the CLI bridge.
+        Falls back to any enabled reviewer, then None (→ skip auto-review).
         """
         from agena_models.models.user_preference import UserPreference
 
@@ -3214,10 +3217,17 @@ class OrchestrationService:
             return None
         if not isinstance(agents, list):
             return None
-        for a in agents:
-            if isinstance(a, dict) and a.get('is_reviewer') and a.get('enabled', True) and a.get('role'):
+        reviewers = [
+            a for a in agents
+            if isinstance(a, dict) and a.get('is_reviewer') and a.get('enabled', True) and a.get('role')
+        ]
+        if not reviewers:
+            return None
+        # Prefer a CLI-backed reviewer (works via the bridge, no API key).
+        for a in reviewers:
+            if (a.get('provider') or '').strip().lower() in ('claude_cli', 'codex_cli'):
                 return str(a['role'])
-        return None
+        return str(reviewers[0]['role'])
 
     async def _maybe_auto_review(
         self,
