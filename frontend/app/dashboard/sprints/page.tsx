@@ -1745,20 +1745,25 @@ function DetailPanel({ item, onClose, project, integrations, aiLoading, aiResult
   return createPortal(
     <div
       onClick={onClose}
-      style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)' }}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 9999,
+        background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
     >
     <div
       onClick={(e) => e.stopPropagation()}
       style={{
-      width: 420, maxWidth: 'calc(100vw - 24px)',
-      borderRadius: 10,
+      width: 'min(1180px, 96vw)', maxWidth: '96vw',
+      borderRadius: 16,
       border: '1px solid var(--panel-border-3)',
       background: 'var(--surface)',
       overflow: 'hidden',
-      boxShadow: '0 12px 32px rgba(0,0,0,0.25)',
+      boxShadow: '0 32px 100px rgba(0,0,0,0.5)',
       display: 'flex', flexDirection: 'column',
-      height: 'calc(100vh - 32px)',
-      position: 'fixed', top: 16, right: 16, zIndex: 10000,
+      height: 'min(900px, 92vh)', maxHeight: '92vh',
+      zIndex: 10000,
     }}>
       <div style={{ height: 2, background: 'var(--panel-border)' }} />
 
