@@ -310,6 +310,176 @@ class AzurePRService:
             work_item_id=work_item_id,
         )
 
+    # ── Branch / PR lifecycle (used by the flow azure_devops node) ─────────
+    #
+    # All additive: nothing above this block changes, so the orchestration
+    # pipeline's create_pr path is untouched.
+
+    async def _require_config(self, organization_id: int):
+        config = await IntegrationConfigService(self.db).get_config(organization_id, 'azure')
+        if config is None or not config.secret:
+            raise ValueError('Azure integration not configured')
+        return config
+
+    def _proj_seg(self, project: str) -> str:
+        """URL-encode the project path segment. unquote→quote so an already
+        encoded value ('YESIMTECH%20PROJECT') doesn't get double-encoded."""
+        from urllib.parse import quote, unquote
+        return quote(unquote(project or ''), safe='')
+
+    async def create_branch(
+        self,
+        organization_id: int,
+        *,
+        project: str,
+        repo_name: str,
+        branch: str,
+        source_branch: str,
+    ) -> dict[str, object]:
+        """Create refs/heads/{branch} at the tip of {source_branch}."""
+        config = await self._require_config(organization_id)
+        org_url = config.base_url.rstrip('/')
+        headers = self._headers(config.secret)
+        proj = self._proj_seg(project)
+
+        refs_api = (
+            f'{org_url}/{proj}/_apis/git/repositories/{repo_name}'
+            f'/refs?filter=heads/{source_branch}&api-version=7.1-preview.1'
+        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(refs_api, headers=headers)
+            r.raise_for_status()
+            refs = r.json().get('value', [])
+            if not refs:
+                raise ValueError(f'Source branch {source_branch} not found in {project}/{repo_name}')
+            source_object_id = refs[0]['objectId']
+
+            update_api = (
+                f'{org_url}/{proj}/_apis/git/repositories/{repo_name}'
+                f'/refs?api-version=7.1-preview.1'
+            )
+            r = await client.post(update_api, headers=headers, json=[{
+                'name': f'refs/heads/{branch}',
+                'oldObjectId': '0' * 40,
+                'newObjectId': source_object_id,
+            }])
+            r.raise_for_status()
+            results = r.json().get('value', [])
+        ok = bool(results and results[0].get('success'))
+        return {'branch': branch, 'object_id': source_object_id, 'created': ok}
+
+    async def _fetch_pr(self, *, org_url: str, proj: str, repo_name: str, pr_id: int, headers: dict[str, str]) -> dict:
+        api = (
+            f'{org_url}/{proj}/_apis/git/repositories/{repo_name}'
+            f'/pullrequests/{pr_id}?api-version=7.1-preview.1'
+        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(api, headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def approve_pr(
+        self,
+        organization_id: int,
+        *,
+        project: str,
+        repo_name: str,
+        pr_id: int,
+    ) -> dict[str, object]:
+        """Cast an Approve (vote=10) on the PR as the PAT's identity."""
+        config = await self._require_config(organization_id)
+        org_url = config.base_url.rstrip('/')
+        headers = self._headers(config.secret)
+        proj = self._proj_seg(project)
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            conn = await client.get(
+                f'{org_url}/_apis/connectionData?api-version=7.1-preview.1',
+                headers=headers,
+            )
+            conn.raise_for_status()
+            reviewer_id = ((conn.json() or {}).get('authenticatedUser') or {}).get('id') or ''
+            if not reviewer_id:
+                raise ValueError('Could not resolve the PAT identity for the approve vote')
+
+            vote_api = (
+                f'{org_url}/{proj}/_apis/git/repositories/{repo_name}'
+                f'/pullrequests/{pr_id}/reviewers/{reviewer_id}?api-version=7.1-preview.1'
+            )
+            r = await client.put(vote_api, headers=headers, json={'vote': 10})
+            r.raise_for_status()
+        return {'pr_id': pr_id, 'vote': 10, 'reviewer_id': reviewer_id}
+
+    async def complete_pr(
+        self,
+        organization_id: int,
+        *,
+        project: str,
+        repo_name: str,
+        pr_id: int,
+        delete_source_branch: bool = False,
+        merge_strategy: str = 'noFastForward',
+    ) -> dict[str, object]:
+        """Complete (merge) the PR. Reads lastMergeSourceCommit first — Azure
+        requires it on the PATCH so a racing push can't merge unseen commits."""
+        config = await self._require_config(organization_id)
+        org_url = config.base_url.rstrip('/')
+        headers = self._headers(config.secret)
+        proj = self._proj_seg(project)
+
+        pr = await self._fetch_pr(org_url=org_url, proj=proj, repo_name=repo_name, pr_id=pr_id, headers=headers)
+        if (pr.get('status') or '') == 'completed':
+            return {'pr_id': pr_id, 'status': 'completed', 'already_completed': True}
+        last_merge_source = pr.get('lastMergeSourceCommit')
+        if not last_merge_source:
+            raise ValueError(f'PR {pr_id} has no lastMergeSourceCommit (merge conflict or not ready)')
+
+        patch_api = (
+            f'{org_url}/{proj}/_apis/git/repositories/{repo_name}'
+            f'/pullrequests/{pr_id}?api-version=7.1-preview.1'
+        )
+        payload = {
+            'status': 'completed',
+            'lastMergeSourceCommit': last_merge_source,
+            'completionOptions': {
+                'deleteSourceBranch': delete_source_branch,
+                'mergeStrategy': merge_strategy,
+            },
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.patch(patch_api, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        return {
+            'pr_id': pr_id,
+            'status': str(data.get('status') or ''),
+            'merge_status': str(data.get('mergeStatus') or ''),
+            'closed_date': str(data.get('closedDate') or ''),
+        }
+
+    async def abandon_pr(
+        self,
+        organization_id: int,
+        *,
+        project: str,
+        repo_name: str,
+        pr_id: int,
+    ) -> dict[str, object]:
+        config = await self._require_config(organization_id)
+        org_url = config.base_url.rstrip('/')
+        headers = self._headers(config.secret)
+        proj = self._proj_seg(project)
+
+        patch_api = (
+            f'{org_url}/{proj}/_apis/git/repositories/{repo_name}'
+            f'/pullrequests/{pr_id}?api-version=7.1-preview.1'
+        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.patch(patch_api, headers=headers, json={'status': 'abandoned'})
+            r.raise_for_status()
+            data = r.json()
+        return {'pr_id': pr_id, 'status': str(data.get('status') or '')}
+
     def _headers(self, pat: str) -> dict[str, str]:
         token = base64.b64encode(f':{pat}'.encode()).decode()
         return {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}

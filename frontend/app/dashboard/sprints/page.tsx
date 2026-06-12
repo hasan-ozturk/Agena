@@ -949,10 +949,17 @@ export default function SprintsPage() {
   }
 
   async function handleRunFlow(flowId: string, item: WorkItem, options?: FlowRunOptions) {
+    // Flow nodes can run through an API LLM (OpenAI/Gemini key) OR the local
+    // CLI bridge (claude_cli / codex_cli agents — no API key needed). Block
+    // only when NEITHER backend is available; the executor also has its own
+    // CLI fallback for CLI-only orgs.
     const hasLlmKey = integrations.some(
       (c) => (c.provider === 'openai' || c.provider === 'gemini') && c.has_secret,
     );
-    if (!hasLlmKey) {
+    const hasCliAgent = agentConfigs.some(
+      (a) => a.enabled && (a.provider === 'claude_cli' || a.provider === 'codex_cli'),
+    );
+    if (!hasLlmKey && !hasCliAgent) {
       setFlowError('noLlmKey');
       setTimeout(() => setFlowError(''), 6000);
       return;

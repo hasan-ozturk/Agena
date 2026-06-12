@@ -1,12 +1,15 @@
 """Flow run endpoints."""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,6 +19,8 @@ from agena_models.models.flow_assets import AgentAnalyticsSnapshot, FlowTemplate
 from agena_models.models.flow_run import FlowRun, FlowRunStep
 from agena_models.models.user_preference import UserPreference
 from agena_services.services.flow_executor import run_flow
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix='/flows', tags=['flows'])
 
@@ -215,6 +220,168 @@ async def get_run(
     if not run:
         raise HTTPException(status_code=404, detail='Run bulunamadı')
     return _run_out(run)
+
+
+async def _resume_flow_run_bg(run_id: int, organization_id: int, snapshot_raw: str | None) -> None:
+    """Resume a paused flow run on a fresh session (fire-and-forget).
+
+    The {flow, task, user_id} snapshot was persisted into the gate step's
+    input_json at pause time, so this survives Redis flushes and works no
+    matter which entry path (sync API / worker) started the run. Any
+    failure flips the run back to 'pending_approval' so the user can simply
+    click Approve again."""
+    from agena_core.database import SessionLocal
+
+    try:
+        snapshot = json.loads(snapshot_raw or '{}')
+    except Exception:
+        snapshot = {}
+    flow = snapshot.get('flow')
+    task = snapshot.get('task') or {}
+    user_id = int(snapshot.get('user_id') or 0)
+
+    async with SessionLocal() as session:
+        try:
+            run = await session.get(FlowRun, run_id)
+            if run is None:
+                return
+            if not flow:
+                # Legacy/last-resort fallback: rebuild from the user's saved
+                # flows. Validated implicitly — unknown node ids simply have
+                # no prior steps and re-execute.
+                pref = (await session.execute(
+                    select(UserPreference).where(UserPreference.user_id == run.user_id)
+                )).scalar_one_or_none()
+                flows = json.loads(pref.flows_json) if pref and pref.flows_json else []
+                flow = next((f for f in flows if f.get('id') == run.flow_id), None)
+                user_id = user_id or run.user_id
+                task = task or {'id': run.task_id, 'title': run.task_title or ''}
+                if not flow:
+                    raise ValueError('Flow definition not found for resume (snapshot and saved flows both missing)')
+            await run_flow(
+                flow=flow,
+                task=task,
+                user_id=user_id or run.user_id,
+                organization_id=organization_id,
+                db=session,
+                resume_run_id=run_id,
+            )
+        except Exception:
+            logger.exception('Flow resume failed for run %s', run_id)
+            try:
+                run = await session.get(FlowRun, run_id)
+                if run is not None and run.status in ('resuming', 'running'):
+                    run.status = 'pending_approval'
+                    await session.commit()
+            except Exception:
+                pass
+
+
+@router.post('/runs/{run_id}/approve', response_model=RunOut)
+async def approve_run(
+    run_id: int,
+    tenant: CurrentTenant = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db_session),
+) -> RunOut:
+    """Onay kapısında bekleyen koşuyu onaylar ve arka planda devam ettirir."""
+    # Conditional UPDATE → exactly one concurrent approve wins; the loser
+    # (double click) sees rowcount 0 and gets a 409 instead of a second
+    # resume task.
+    upd = await db.execute(
+        update(FlowRun)
+        .where(
+            FlowRun.id == run_id,
+            FlowRun.user_id == tenant.user_id,
+            FlowRun.status == 'pending_approval',
+        )
+        .values(status='resuming')
+    )
+    if (upd.rowcount or 0) == 0:
+        existing = (await db.execute(
+            select(FlowRun).where(FlowRun.id == run_id, FlowRun.user_id == tenant.user_id)
+        )).scalar_one_or_none()
+        if existing is None:
+            raise HTTPException(status_code=404, detail='Run bulunamadı')
+        raise HTTPException(status_code=409, detail=f'Run is not pending approval (status={existing.status})')
+
+    gate = (await db.execute(
+        select(FlowRunStep)
+        .where(FlowRunStep.run_id == run_id, FlowRunStep.status == 'awaiting_approval')
+        .order_by(FlowRunStep.id.desc())
+    )).scalars().first()
+    snapshot_raw = gate.input_json if gate is not None else None
+    if gate is not None:
+        gate.status = 'approved'
+        gate.finished_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    asyncio.create_task(_resume_flow_run_bg(run_id, tenant.organization_id, snapshot_raw))
+
+    run_row = (await db.execute(
+        select(FlowRun)
+        .where(FlowRun.id == run_id, FlowRun.user_id == tenant.user_id)
+        .options(selectinload(FlowRun.steps))
+    )).scalar_one_or_none()
+    if not run_row:
+        raise HTTPException(status_code=404, detail='Run bulunamadı')
+    return _run_out(run_row)
+
+
+@router.post('/runs/{run_id}/reject', response_model=RunOut)
+async def reject_run(
+    run_id: int,
+    tenant: CurrentTenant = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db_session),
+) -> RunOut:
+    """Onay kapısında bekleyen koşuyu reddeder (terminal)."""
+    upd = await db.execute(
+        update(FlowRun)
+        .where(
+            FlowRun.id == run_id,
+            FlowRun.user_id == tenant.user_id,
+            FlowRun.status == 'pending_approval',
+        )
+        .values(status='rejected', finished_at=datetime.now(timezone.utc))
+    )
+    if (upd.rowcount or 0) == 0:
+        existing = (await db.execute(
+            select(FlowRun).where(FlowRun.id == run_id, FlowRun.user_id == tenant.user_id)
+        )).scalar_one_or_none()
+        if existing is None:
+            raise HTTPException(status_code=404, detail='Run bulunamadı')
+        raise HTTPException(status_code=409, detail=f'Run is not pending approval (status={existing.status})')
+
+    gate = (await db.execute(
+        select(FlowRunStep)
+        .where(FlowRunStep.run_id == run_id, FlowRunStep.status == 'awaiting_approval')
+        .order_by(FlowRunStep.id.desc())
+    )).scalars().first()
+    if gate is not None:
+        gate.status = 'rejected'
+        gate.finished_at = datetime.now(timezone.utc)
+
+    # Best-effort: release the linked task out of waiting_approval.
+    run_for_task = (await db.execute(
+        select(FlowRun).where(FlowRun.id == run_id)
+    )).scalar_one_or_none()
+    if run_for_task and (run_for_task.task_id or '').strip().isdigit():
+        try:
+            from agena_models.models.task_record import TaskRecord
+            task_row = await db.get(TaskRecord, int(run_for_task.task_id))
+            if task_row is not None and task_row.status == 'waiting_approval':
+                task_row.status = 'cancelled'
+        except Exception:
+            pass
+    await db.commit()
+
+    run_row = (await db.execute(
+        select(FlowRun)
+        .where(FlowRun.id == run_id, FlowRun.user_id == tenant.user_id)
+        .options(selectinload(FlowRun.steps))
+    )).scalar_one_or_none()
+    if not run_row:
+        raise HTTPException(status_code=404, detail='Run bulunamadı')
+    return _run_out(run_row)
 
 
 @router.get('/templates', response_model=list[FlowTemplateOut])

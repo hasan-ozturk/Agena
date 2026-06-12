@@ -3127,7 +3127,10 @@ class OrchestrationService:
     async def _resolve_mapping_from_prefs(self, task: TaskRecord) -> 'RepoMapping | None':
         """Build a detached RepoMapping from the creator's preferences JSON."""
         from agena_models.models.repo_mapping import RepoMapping
-        from agena_models.models.user_preference import UserPreference
+        from agena_services.services.devops_board_service import (
+            find_mapping_by_name,
+            load_prefs_mappings,
+        )
 
         # Mapping name from the task's ``Local Repo Mapping: <name>`` line.
         wanted_name: str | None = None
@@ -3144,20 +3147,8 @@ class OrchestrationService:
         user_id = getattr(task, 'created_by_user_id', None)
         if not user_id:
             return None
-        pref = (await self.db_session.execute(
-            select(UserPreference).where(UserPreference.user_id == user_id)
-        )).scalar_one_or_none()
-        if not pref or not pref.repo_mappings_json:
-            return None
-        try:
-            import json as _json
-            mappings = _json.loads(pref.repo_mappings_json)
-        except Exception:
-            return None
-        if not isinstance(mappings, list):
-            return None
-
-        entry = next((m for m in mappings if isinstance(m, dict) and m.get('name') == wanted_name), None)
+        mappings = await load_prefs_mappings(self.db_session, int(user_id))
+        entry = find_mapping_by_name(mappings, wanted_name)
         if not entry:
             return None
 

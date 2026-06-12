@@ -1535,6 +1535,219 @@ class AzureDevOpsClient:
             })
         return out
 
+    # ── DevOps Board helpers (live reads + guarded approval action) ────────
+
+    def _devops_creds(self, cfg: dict[str, str]) -> tuple[str, str]:
+        org_url = (cfg.get('org_url') or self.settings.azure_org_url or '').strip().rstrip('/')
+        pat = (cfg.get('pat') or self.settings.azure_pat or '').strip()
+        return org_url, pat
+
+    async def get_pull_request(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+        repo: str,
+        pr_id: str | int,
+    ) -> dict[str, Any] | None:
+        """Live single-PR fetch with the merge-commit fields the board needs
+        for SHA-joining builds to a PR."""
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project or not repo or not pr_id:
+            return None
+        from urllib.parse import quote
+        url = (
+            f'{org_url}/{quote(project)}/_apis/git/repositories/{quote(repo)}'
+            f'/pullrequests/{pr_id}?api-version=7.1-preview.1'
+        )
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                return None
+            pr = resp.json() or {}
+        except Exception:
+            return None
+        web = ((pr.get('_links') or {}).get('web') or {}).get('href') or ''
+        if not web:
+            web = f'{org_url}/{quote(project)}/_git/{quote(repo)}/pullrequest/{pr_id}'
+        return {
+            'id': str(pr.get('pullRequestId') or pr_id),
+            'title': str(pr.get('title') or ''),
+            'status': str(pr.get('status') or ''),
+            'merge_status': str(pr.get('mergeStatus') or ''),
+            'source_branch': str(pr.get('sourceRefName') or '').replace('refs/heads/', ''),
+            'target_branch': str(pr.get('targetRefName') or '').replace('refs/heads/', ''),
+            'last_merge_commit': str(((pr.get('lastMergeCommit') or {}).get('commitId')) or ''),
+            'last_merge_source_commit': str(((pr.get('lastMergeSourceCommit') or {}).get('commitId')) or ''),
+            'closed_date': str(pr.get('closedDate') or ''),
+            'repository_name': str(((pr.get('repository') or {}).get('name')) or ''),
+            'project_name': str((((pr.get('repository') or {}).get('project') or {}).get('name')) or ''),
+            'url': web,
+        }
+
+    def _map_build(self, build: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'id': int(build.get('id') or 0),
+            'definition_name': str(((build.get('definition') or {}).get('name')) or ''),
+            'source_branch': str(build.get('sourceBranch') or '').replace('refs/heads/', ''),
+            'source_version': str(build.get('sourceVersion') or ''),
+            'status': str(build.get('status') or ''),
+            'result': str(build.get('result') or ''),
+            'queue_time': str(build.get('queueTime') or ''),
+            'finish_time': str(build.get('finishTime') or ''),
+            'web_url': str(((build.get('_links') or {}).get('web') or {}).get('href') or ''),
+            'repository_name': str(((build.get('repository') or {}).get('name')) or ''),
+            'project_name': str(((build.get('project') or {}).get('name')) or ''),
+        }
+
+    async def list_builds(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+        top: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Recent builds of a project (all statuses incl. inProgress), live."""
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project:
+            return []
+        from urllib.parse import quote
+        url = f'{org_url}/{quote(project)}/_apis/build/builds?$top={int(top)}&api-version=7.1'
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                raise RuntimeError(f'Azure {resp.status_code}: {resp.text[:200]}')
+            rows = (resp.json() or {}).get('value', []) or []
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f'Azure list builds failed: {exc}') from exc
+        return [self._map_build(b) for b in rows]
+
+    async def get_build(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+        build_id: int,
+    ) -> dict[str, Any] | None:
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project or not build_id:
+            return None
+        from urllib.parse import quote
+        url = f'{org_url}/{quote(project)}/_apis/build/builds/{int(build_id)}?api-version=7.1'
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                return None
+            return self._map_build(resp.json() or {})
+        except Exception:
+            return None
+
+    async def list_pending_approvals(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+    ) -> list[dict[str, Any]]:
+        """Pending pipeline approvals for a project. NOTE: on this org the
+        structured `pipeline` field comes back empty — identity must be
+        resolved by parsing `Build ID:` out of `instructions` and
+        cross-checking the build (see devops_board_service.classify_build).
+        """
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project:
+            return []
+        from urllib.parse import quote
+        url = (
+            f'{org_url}/{quote(project)}/_apis/pipelines/approvals'
+            '?statusFilter=pending&$expand=steps&api-version=7.1-preview.1'
+        )
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                raise RuntimeError(f'Azure {resp.status_code}: {resp.text[:200]}')
+            rows = (resp.json() or {}).get('value', []) or []
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f'Azure list approvals failed: {exc}') from exc
+        return [{
+            'id': str(a.get('id') or ''),
+            'status': str(a.get('status') or ''),
+            'created_on': str(a.get('createdOn') or ''),
+            'instructions': str(a.get('instructions') or ''),
+        } for a in rows]
+
+    async def patch_approval(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+        approval_id: str,
+        status: str,
+        comment: str = '',
+    ) -> dict[str, Any]:
+        """Approve/reject a pipeline approval. Callers MUST classify first —
+        this is the raw action (devops_board_service.act_on_approval is the
+        guarded entrypoint)."""
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project or not approval_id:
+            raise RuntimeError('Azure approval action: missing credentials or id')
+        from urllib.parse import quote
+        url = f'{org_url}/{quote(project)}/_apis/pipelines/approvals?api-version=7.1-preview.1'
+        body = [{'approvalId': approval_id, 'status': status, 'comment': comment or ''}]
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.patch(url, headers=self._headers(pat), json=body)
+        if resp.status_code != 200:
+            raise RuntimeError(f'Azure approval PATCH {resp.status_code}: {resp.text[:200]}')
+        data = resp.json() or {}
+        rows = data.get('value', [data] if isinstance(data, dict) else [])
+        first = rows[0] if rows else {}
+        return {'id': str(first.get('id') or approval_id), 'status': str(first.get('status') or '')}
+
+    async def get_work_items_batch(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+        ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """One call for N work items: id → {title, state, type, url}."""
+        org_url, pat = self._devops_creds(cfg)
+        clean_ids = [str(i).strip() for i in ids if str(i).strip().isdigit()]
+        if not org_url or not pat or not clean_ids:
+            return {}
+        url = (
+            f'{org_url}/_apis/wit/workitems?ids={",".join(clean_ids[:200])}'
+            '&fields=System.Title,System.State,System.WorkItemType'
+            '&$errorPolicy=omit&api-version=7.1'
+        )
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                return {}
+            rows = (resp.json() or {}).get('value', []) or []
+        except Exception:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for wi in rows:
+            wid = str(wi.get('id') or '')
+            fields = wi.get('fields') or {}
+            out[wid] = {
+                'id': wid,
+                'title': str(fields.get('System.Title') or ''),
+                'state': str(fields.get('System.State') or ''),
+                'type': str(fields.get('System.WorkItemType') or ''),
+                'url': self._build_work_item_web_url(org_url=org_url, project=project, item_id=wid),
+            }
+        return out
+
     async def fetch_pr_changed_files(
         self,
         *,

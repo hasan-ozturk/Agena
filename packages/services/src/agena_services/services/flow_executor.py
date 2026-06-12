@@ -340,20 +340,129 @@ async def _load_latest_code_diff(db: AsyncSession, task_id: int, organization_id
     return str(msg or '').strip()
 
 
-async def _build_lead_llm_for_task(
+def _local_repo_path_from_task(task: dict[str, Any] | None) -> str:
+    """Pull the mapped local repo path out of the task payload so CLI-backed
+    flow nodes open the agent on the real checkout (read-only) instead of
+    /tmp. Sprints' runFlow puts it in task['local_repo_path']; tasks created
+    by Assign AI carry a 'Local Repo Path:' line in the description."""
+    if not task:
+        return '/tmp'
+    direct = str(task.get('local_repo_path') or '').strip()
+    if direct:
+        return direct
+    for line in str(task.get('description') or '').splitlines():
+        if line.strip().lower().startswith('local repo path:'):
+            value = line.split(':', 1)[1].strip()
+            if value:
+                return value
+    return '/tmp'
+
+
+async def _run_cli_llm(
+    *,
+    cli_provider: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    repo_path: str = '/tmp',
+) -> tuple[str, dict[str, int]]:
+    """Round-trip a flow-node prompt through the host CLI bridge (claude /
+    codex) in a read-only sandbox. Same pattern as review_service's
+    _run_cli_review; like task_ai_fill we prefer a non-empty stdout even when
+    the CLI exits non-zero (claude often emits CA-bundle noise on stderr but
+    still writes the answer). Returns (output_text, usage_dict)."""
+    import os
+    bridge_url = os.getenv('CLI_BRIDGE_URL', 'http://cli-bridge:9876')
+    cli = 'claude' if cli_provider == 'claude_cli' else 'codex'
+    cli_timeout = int(os.getenv('FLOW_CLI_TIMEOUT_SEC', '600'))
+    full_prompt = f'{system_prompt}\n\n---\n\n{user_prompt}' if system_prompt else user_prompt
+    try:
+        async with httpx.AsyncClient(timeout=cli_timeout + 30) as client:
+            resp = await client.post(
+                f'{bridge_url}/{cli}',
+                json={
+                    'repo_path': repo_path or '/tmp',
+                    'prompt': full_prompt,
+                    'model': model or '',
+                    'timeout': cli_timeout,
+                    'read_only': True,
+                },
+            )
+            data = resp.json()
+    except httpx.ConnectError as exc:
+        raise RuntimeError(f'CLI bridge unreachable at {bridge_url}') from exc
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(f'CLI bridge timed out after {cli_timeout}s') from exc
+    except (httpx.RequestError, ValueError) as exc:
+        raise RuntimeError(f'CLI bridge request failed: {exc}') from exc
+
+    raw_usage = data.get('usage') or {}
+    prompt_tokens = int(raw_usage.get('input_tokens') or raw_usage.get('prompt_tokens') or 0)
+    completion_tokens = int(raw_usage.get('output_tokens') or raw_usage.get('completion_tokens') or 0)
+    usage = {
+        'prompt_tokens': prompt_tokens,
+        'completion_tokens': completion_tokens,
+        'total_tokens': prompt_tokens + completion_tokens,
+    }
+    stdout = (data.get('stdout') or '').strip()
+    if stdout:
+        return stdout, usage
+    if data.get('status') != 'ok':
+        raise RuntimeError(f'{cli} bridge: {data.get("message", data.get("stderr", "unknown"))}')
+    raise RuntimeError(f'{cli} bridge returned empty output')
+
+
+class _CLIBackedLLM:
+    """Duck-types LLMProvider.generate() but routes through the CLI bridge.
+
+    Lets CLI-only orgs (no OpenAI/Gemini key — auth comes from the bridge's
+    claude/codex login) run analyzer / planner / reviewer / generic agent
+    flow nodes. Call sites keep the exact `llm.generate(...)` contract:
+    returns (output, usage, model, was_cached=False)."""
+
+    def __init__(self, cli_provider: str, model: str | None, repo_path: str = '/tmp') -> None:
+        self.cli_provider = cli_provider if cli_provider in ('claude_cli', 'codex_cli') else 'claude_cli'
+        self.model = (model or '').strip()
+        self.repo_path = repo_path or '/tmp'
+
+    async def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        complexity_hint: str = 'normal',
+        max_output_tokens: int = 2500,
+        skip_cache: bool = False,
+        image_inputs: list[str] | None = None,
+    ) -> tuple[str, dict[str, int], str, bool]:
+        output, usage = await _run_cli_llm(
+            cli_provider=self.cli_provider,
+            model=self.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            repo_path=self.repo_path,
+        )
+        return output, usage, self.model or self.cli_provider, False
+
+
+async def _build_flow_llm(
     db: AsyncSession,
     organization_id: int,
-    task_row: TaskRecord,
-    node: dict[str, Any],
-) -> LLMProvider | None:
-    meta = _parse_task_meta_from_description(str(task_row.description or ''))
-    raw_provider = (str(node.get('provider') or '') or meta.get('preferred agent provider') or 'openai').strip().lower()
-    model = (str(node.get('model') or '') or meta.get('preferred agent model') or '').strip() or None
+    *,
+    raw_provider: str,
+    model: str | None,
+    repo_path: str = '/tmp',
+):
+    """Resolve the LLM backend for a flow node.
 
-    # CLI providers can't do direct LLM calls — try available API providers
-    provider = raw_provider
+    - claude_cli / codex_cli → CLI bridge (no API key needed).
+    - openai / gemini → API provider with the existing openai→gemini
+      key-fallback chain.
+    - No usable API key at all (CLI-only org) → last-resort claude CLI
+      bridge, so presets keep working without per-node provider edits.
+    Orgs WITH an API key keep today's behavior exactly."""
+    provider = (raw_provider or '').strip().lower()
     if provider in ('claude_cli', 'codex_cli'):
-        provider = 'openai'  # will try openai, then gemini fallback below
+        return _CLIBackedLLM(provider, model, repo_path)
 
     if provider not in {'openai', 'gemini'}:
         provider = 'openai'
@@ -362,7 +471,6 @@ async def _build_lead_llm_for_task(
     key = (cfg.secret if cfg else '') or ''
     base_url = (cfg.base_url if cfg else '') or ''
 
-    # Fallback chain: try openai → gemini → any available provider
     if not key or key.startswith('your_'):
         for fallback_provider in ('openai', 'gemini'):
             if fallback_provider == provider:
@@ -374,14 +482,33 @@ async def _build_lead_llm_for_task(
                 provider = fallback_provider
                 break
 
-    llm = LLMProvider(
+    if not key or key.startswith('your_'):
+        logger.info('Flow LLM: no API provider configured for org %s — falling back to claude CLI bridge', organization_id)
+        return _CLIBackedLLM('claude_cli', model, repo_path)
+
+    return LLMProvider(
         provider=provider,
-        api_key=key or None,
+        api_key=key,
         base_url=base_url or None,
         small_model=model,
         large_model=model,
     )
-    return llm
+
+
+async def _build_lead_llm_for_task(
+    db: AsyncSession,
+    organization_id: int,
+    task_row: TaskRecord,
+    node: dict[str, Any],
+):
+    meta = _parse_task_meta_from_description(str(task_row.description or ''))
+    raw_provider = (str(node.get('provider') or '') or meta.get('preferred agent provider') or 'openai').strip().lower()
+    model = (str(node.get('model') or '') or meta.get('preferred agent model') or '').strip() or None
+    repo_path = (meta.get('local repo path') or '').strip() or '/tmp'
+    return await _build_flow_llm(
+        db, organization_id,
+        raw_provider=raw_provider, model=model, repo_path=repo_path,
+    )
 
 
 async def _skill_block_for_task(
@@ -434,25 +561,13 @@ async def _run_product_review_node(
     )
     model = resolved_model
 
-    # LLM resolve — org'un kayıtlı provider'ını kullan
-    provider = (str(node.get('provider') or resolved_provider or '') or 'openai').strip().lower()
-    if provider not in {'openai', 'gemini'}:
-        provider = 'openai'
-    cfg = await IntegrationConfigService(db).get_config(organization_id, provider)
-    api_key = (cfg.secret if cfg else '') or ''
-    base_url = (cfg.base_url if cfg else '') or ''
-    if not api_key or api_key.startswith('your_'):
-        fallback = await IntegrationConfigService(db).get_config(organization_id, 'openai')
-        api_key = (fallback.secret if fallback else '') or ''
-        base_url = (fallback.base_url if fallback else '') or ''
-        provider = 'openai'
-
-    llm = LLMProvider(
-        provider=provider,
-        api_key=api_key or None,
-        base_url=base_url or None,
-        small_model=model,
-        large_model=model,
+    # LLM resolve — org'un kayıtlı provider'ını kullan; claude_cli/codex_cli
+    # node'ları bridge üzerinden çalışır (CLI-only org desteği).
+    llm = await _build_flow_llm(
+        db, organization_id,
+        raw_provider=str(node.get('provider') or resolved_provider or ''),
+        model=model,
+        repo_path=_local_repo_path_from_task(task),
     )
 
     # Use custom prompt if specified in node, otherwise fall back to system default
@@ -536,6 +651,9 @@ async def _run_product_review_node(
             'role': role,
             'model': used_model,
             'output': parsed,
+            # Persisted in FlowRunStep.output_json so an approval-gate resume
+            # can restore context['product_review_raw'] (planner reads it).
+            'raw_output': output[:8000],
             'usage': usage_meta,
         }
     except Exception as exc:
@@ -558,21 +676,11 @@ async def _run_planner_node(
     resolved_model, resolved_provider = await _resolve_agent_model(
         db, user_id, role, node.get('model', ''), default='gpt-4o',
     )
-    provider = (str(node.get('provider') or resolved_provider or '') or 'openai').strip().lower()
-    if provider not in {'openai', 'gemini'}:
-        provider = 'openai'
-    cfg = await IntegrationConfigService(db).get_config(organization_id, provider)
-    api_key = (cfg.secret if cfg else '') or ''
-    base_url = (cfg.base_url if cfg else '') or ''
-    if not api_key or api_key.startswith('your_'):
-        fallback = await IntegrationConfigService(db).get_config(organization_id, 'openai')
-        api_key = (fallback.secret if fallback else '') or ''
-        base_url = (fallback.base_url if fallback else '') or ''
-        provider = 'openai'
-
-    llm = LLMProvider(
-        provider=provider, api_key=api_key or None, base_url=base_url or None,
-        small_model=resolved_model, large_model=resolved_model,
+    llm = await _build_flow_llm(
+        db, organization_id,
+        raw_provider=str(node.get('provider') or resolved_provider or ''),
+        model=resolved_model,
+        repo_path=_local_repo_path_from_task(task),
     )
 
     # Use node-level prompt_slug or default planner prompt
@@ -742,25 +850,13 @@ async def _run_agent_node(
             organization_id=organization_id,
         )
 
-    # Diğer roller için LLM çağrısı
-    provider = (str(node.get('provider') or '') or 'openai').strip().lower()
-    if provider not in {'openai', 'gemini'}:
-        provider = 'openai'
-    cfg = await IntegrationConfigService(db).get_config(organization_id, provider)
-    api_key = (cfg.secret if cfg else '') or ''
-    base_url = (cfg.base_url if cfg else '') or ''
-    if not api_key or api_key.startswith('your_'):
-        fallback = await IntegrationConfigService(db).get_config(organization_id, 'openai')
-        api_key = (fallback.secret if fallback else '') or ''
-        base_url = (fallback.base_url if fallback else '') or ''
-        provider = 'openai'
-
-    llm = LLMProvider(
-        provider=provider,
-        api_key=api_key or None,
-        base_url=base_url or None,
-        small_model=model,
-        large_model=model,
+    # Diğer roller için LLM çağrısı — claude_cli/codex_cli node'ları bridge
+    # üzerinden, API provider'ları eski fallback zinciriyle çalışır.
+    llm = await _build_flow_llm(
+        db, organization_id,
+        raw_provider=str(node.get('provider') or _resolved_provider or ''),
+        model=model,
+        repo_path=_local_repo_path_from_task(task),
     )
     # Use node-level prompt_slug if set, otherwise default
     prompt_slug = node.get('prompt_slug', '').strip()
@@ -1594,93 +1690,243 @@ async def _run_azure_update_node(
     token = base64.b64encode(f':{config.secret}'.encode()).decode()
     headers = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json-patch+json'}
     url = f"{config.base_url.rstrip('/')}/_apis/wit/workitems/{task_id}?api-version=7.1-preview.3"
-    patch = [{'op': 'add', 'path': '/fields/System.State', 'value': new_state}]
 
+    # State names differ per Azure process template (Agile: Active/Closed,
+    # Scrum: Committed/Done, Basic: Doing/Done). Presets say "In Progress" /
+    # "Done"; when the work item type rejects that value (400), walk the
+    # equivalents so the same flow works on any process.
+    _STATE_FALLBACKS: dict[str, list[str]] = {
+        'in progress': ['Active', 'Doing', 'Committed'],
+        'active': ['In Progress', 'Doing', 'Committed'],
+        'done': ['Closed', 'Completed', 'Resolved'],
+        'closed': ['Done', 'Completed', 'Resolved'],
+        'resolved': ['Closed', 'Done'],
+    }
+    candidates = [new_state] + [
+        s for s in _STATE_FALLBACKS.get(str(new_state).strip().lower(), []) if s != new_state
+    ]
+
+    last_status = 0
+    last_body = ''
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.patch(url, headers=headers, json=patch)
-            return {'status': 'ok' if r.is_success else 'error', 'http_status': r.status_code, 'new_state': new_state}
+            for candidate in candidates:
+                patch = [{'op': 'add', 'path': '/fields/System.State', 'value': candidate}]
+                r = await client.patch(url, headers=headers, json=patch)
+                if r.is_success:
+                    return {'status': 'ok', 'http_status': r.status_code, 'new_state': candidate,
+                            'requested_state': new_state}
+                last_status = r.status_code
+                last_body = (r.text or '')[:300]
+                # Only a state-not-supported 400 is worth retrying with an
+                # equivalent; auth/permission/id errors won't change.
+                if r.status_code != 400 or 'not in the list of supported values' not in last_body:
+                    break
+            return {'status': 'error', 'http_status': last_status, 'new_state': new_state,
+                    'message': f'Azure state update failed ({last_status}): {last_body[:180]}'}
     except Exception as e:
         return {'status': 'error', 'message': str(e)}
+
+
+def _discover_pr_in_outputs(context: dict[str, Any], svc: AzurePRService) -> tuple[str, int | None, str, str]:
+    """Scan prior node outputs for a PR produced earlier in the flow.
+
+    Returns (pr_url, pr_id, project, repo_name) — empty/None when nothing
+    found. The developer pipeline node returns `pr_url`; the create_pr
+    azure node returns `pr_id` + `pr_url`. URL parsing wins for project /
+    repo because it reflects where the PR actually lives."""
+    pr_url = ''
+    pr_id: int | None = None
+    for out in (context.get('outputs') or {}).values():
+        if not isinstance(out, dict):
+            continue
+        if out.get('pr_id') and not pr_id:
+            try:
+                pr_id = int(out['pr_id'])
+            except (TypeError, ValueError):
+                pass
+        for key in ('pr_url', 'new_pr_url', 'pull_request_url'):
+            candidate = str(out.get(key) or '').strip()
+            if candidate and not pr_url:
+                pr_url = candidate
+    project = ''
+    repo_name = ''
+    if pr_url:
+        ref = svc._parse_pr_ref(pr_url)
+        if ref:
+            project, repo_name, parsed_id = ref
+            if pr_id is None:
+                try:
+                    pr_id = int(parsed_id)
+                except (TypeError, ValueError):
+                    pass
+    return pr_url, pr_id, project, repo_name
 
 
 async def _run_azure_devops_node(
     node: dict[str, Any], context: dict[str, Any], db: AsyncSession, organization_id: int,
 ) -> dict[str, Any]:
-    """Azure DevOps PR operations: create_branch, create_pr, complete_pr, abandon_pr."""
-    action = node.get('azure_action', 'create_pr')
-    project = node.get('azure_project', '')
-    repo_name = node.get('azure_repo', '')
-    branch = node.get('azure_branch', '')
-    task = context.get('task', {})
+    """Azure DevOps PR operations: create_branch, create_pr, complete_pr, abandon_pr.
 
-    # Variable substitution
+    Project / repo resolution order: explicit node config → parsed from a PR
+    URL earlier in the flow → the task payload (Sprints' runFlow passes
+    `project` and `azure_repo` from the selected repo mapping). create_pr is
+    idempotent: when an earlier node (the developer pipeline) already opened
+    a PR, this node returns it instead of failing or duplicating."""
+    action = node.get('azure_action', 'create_pr')
+    task = context.get('task', {})
+    svc = AzurePRService(db)
+
+    pr_url, pr_id, url_project, url_repo = _discover_pr_in_outputs(context, svc)
+
+    project = str(node.get('azure_project') or '').strip() or url_project or str(task.get('project') or '').strip()
+    repo_raw = str(node.get('azure_repo') or '').strip() or url_repo or str(task.get('azure_repo') or '').strip()
+    repo_name = svc._extract_repo_name(repo_raw) if ('://' in repo_raw or '/_git/' in repo_raw) else repo_raw
+    branch = str(node.get('azure_branch') or '').strip()
+
+    # Variable substitution ({{title}}, {{id}}, ...)
     for k, v in task.items():
         project = project.replace(f'{{{{{k}}}}}', str(v))
         repo_name = repo_name.replace(f'{{{{{k}}}}}', str(v))
         branch = branch.replace(f'{{{{{k}}}}}', str(v))
 
     if not project or not repo_name:
-        return {'status': 'error', 'message': 'Azure project and repo are required'}
+        return {
+            'status': 'error',
+            'message': 'Azure project and repo could not be resolved (set them on the node, '
+                       'or run with a repo mapping selected so the task carries project/azure_repo)',
+        }
 
     try:
-        cfg = await IntegrationConfigService(db).get_config(organization_id, 'azure')
-        if not cfg or not cfg.secret:
-            return {'status': 'error', 'message': 'Azure DevOps integration not configured'}
-
-        pat = cfg.secret
-        org_url = cfg.base_url or ''
-
-        pr_service = AzurePRService(org_url=org_url, pat=pat, project=project)
-
         if action == 'create_branch':
-            result = await pr_service.create_branch(repo_name, branch, source_branch='main')
-            return {'status': 'ok', 'action': 'create_branch', 'branch': branch, **result}
+            source = str(node.get('azure_source_branch') or '').strip() or 'main'
+            result = await svc.create_branch(
+                organization_id, project=project, repo_name=repo_name,
+                branch=branch, source_branch=source,
+            )
+            return {'status': 'ok', 'action': 'create_branch', **result}
 
         elif action == 'create_pr':
-            pr_title = node.get('azure_pr_title', f'AI: {task.get("title", "")}')
-            pr_desc = node.get('azure_pr_description', '')
-            reviewers_str = node.get('azure_reviewers', '')
+            # Idempotent: the developer pipeline node usually opened the PR
+            # already — surface it instead of erroring on a duplicate.
+            if pr_url:
+                return {
+                    'status': 'ok', 'action': 'create_pr', 'pr_url': pr_url,
+                    'pr_id': pr_id, 'reused_existing': True,
+                    'message': 'PR already created earlier in the flow',
+                }
+            source_branch = branch or f'ai/task-{task.get("id", "")}'
+            target_branch = str(node.get('azure_target_branch') or '').strip() or 'main'
+            pr_title = str(node.get('azure_pr_title') or f'AI: {task.get("title", "")}')
+            pr_desc = str(node.get('azure_pr_description') or '')
             for k, v in task.items():
                 pr_title = pr_title.replace(f'{{{{{k}}}}}', str(v))
                 pr_desc = pr_desc.replace(f'{{{{{k}}}}}', str(v))
-            reviewers = [r.strip() for r in reviewers_str.split(',') if r.strip()] if reviewers_str else []
-            result = await pr_service.create_pull_request(
-                repo_name=repo_name,
-                source_branch=branch or f'ai/task-{task.get("id", "")}',
-                target_branch='main',
+            config = await IntegrationConfigService(db).get_config(organization_id, 'azure')
+            org_url = (config.base_url if config else '').rstrip('/')
+            created_url = await svc.create_pr(
+                organization_id,
+                project=project,
+                repo_url=f'{org_url}/{project}/_git/{repo_name}',
+                source_branch=source_branch,
+                target_branch=target_branch,
                 title=pr_title,
                 description=pr_desc,
-                reviewers=reviewers,
             )
-            return {'status': 'ok', 'action': 'create_pr', 'pr_id': result.get('pullRequestId'), **result}
+            created_ref = svc._parse_pr_ref(created_url) if created_url else None
+            return {
+                'status': 'ok', 'action': 'create_pr', 'pr_url': created_url,
+                'pr_id': int(created_ref[2]) if created_ref else None,
+            }
 
         elif action == 'complete_pr':
-            pr_id = context.get('outputs', {}).get(node.get('id', ''), {}).get('pr_id', '')
-            if not pr_id:
-                # Try to find from previous node outputs
-                for out in context.get('outputs', {}).values():
-                    if isinstance(out, dict) and out.get('pr_id'):
-                        pr_id = out['pr_id']
-                        break
-            if not pr_id:
-                return {'status': 'error', 'message': 'No PR ID found to complete'}
-            result = await pr_service.complete_pull_request(repo_name=repo_name, pr_id=int(pr_id))
-            return {'status': 'ok', 'action': 'complete_pr', **result}
+            if pr_id is None:
+                return {'status': 'error', 'message': 'No PR found in flow outputs to complete'}
+
+            # ── Merge guardrails: verify the LIVE PR before touching it ────
+            # Protects against merging the wrong PR (a human's PR or an
+            # unrelated pr_url that leaked into the flow context). Three
+            # invariants; bypass only via explicit node config.
+            work_item_link_verified: bool | None = None
+            if not _bool_val(node.get('azure_skip_guardrails'), False):
+                from urllib.parse import unquote as _unq
+                from agena_services.integrations.azure_client import AzureDevOpsClient as _AzClient
+                _cfg_row = await IntegrationConfigService(db).get_config(organization_id, 'azure')
+                _az_cfg = {
+                    'org_url': ((_cfg_row.base_url if _cfg_row else '') or '').rstrip('/'),
+                    'pat': (_cfg_row.secret if _cfg_row else '') or '',
+                }
+                live_pr = await _AzClient().get_pull_request(
+                    cfg=_az_cfg, project=project, repo=repo_name, pr_id=pr_id,
+                )
+                if live_pr is None:
+                    return {'status': 'error',
+                            'message': f'guardrail: PR {pr_id} could not be fetched for pre-merge verification'}
+                # 1) Agent-branch prefix — only merge branches our agents made.
+                prefix = str(node.get('azure_branch_prefix') or 'agentflow/')
+                src_branch = str(live_pr.get('source_branch') or '')
+                if prefix and not src_branch.startswith(prefix):
+                    return {'status': 'error',
+                            'message': f'guardrail: source branch "{src_branch}" does not start with '
+                                       f'"{prefix}" — refusing to merge a non-agent PR'}
+                # 2) Repo/project identity — the PR must live where this node
+                #    resolved it to live.
+                pr_repo = str(live_pr.get('repository_name') or '')
+                pr_proj = str(live_pr.get('project_name') or '')
+                if pr_repo and pr_repo.lower() != repo_name.lower():
+                    return {'status': 'error',
+                            'message': f'guardrail: PR belongs to repo "{pr_repo}", node resolved "{repo_name}"'}
+                if pr_proj and _unq(project).strip().lower() != pr_proj.strip().lower():
+                    return {'status': 'error',
+                            'message': f'guardrail: PR belongs to project "{pr_proj}", node resolved "{_unq(project)}"'}
+                # 3) PR must still be active (not completed/abandoned).
+                if str(live_pr.get('status') or '') != 'active':
+                    return {'status': 'error',
+                            'message': f'guardrail: PR {pr_id} is not active (status={live_pr.get("status")})'}
+                # Soft check: AB#<work item> link in the title. Warning only —
+                # flow PR titles often come from templates without AB#.
+                wid = str(task.get('id') or '').strip()
+                if wid.isdigit():
+                    work_item_link_verified = f'AB#{wid}' in str(live_pr.get('title') or '')
+                    if not work_item_link_verified:
+                        logger.warning('complete_pr: PR %s title lacks AB#%s link (non-blocking)', pr_id, wid)
+
+            # Approve (vote 10) first so a "minimum reviewers" branch policy
+            # is satisfied; non-fatal — completion may still pass without it.
+            approve_info: dict[str, object] = {}
+            try:
+                approve_info = await svc.approve_pr(
+                    organization_id, project=project, repo_name=repo_name, pr_id=pr_id,
+                )
+            except Exception as approve_exc:
+                logger.warning('Azure PR approve vote failed (continuing to complete): %s', approve_exc)
+                approve_info = {'approve_error': str(approve_exc)[:200]}
+            result = await svc.complete_pr(
+                organization_id, project=project, repo_name=repo_name, pr_id=pr_id,
+                delete_source_branch=bool(node.get('azure_delete_source_branch', False)),
+            )
+            # Namespace Azure's PR fields — `result['status']` is the PR's
+            # state ('completed'), NOT the node status, and must not clobber
+            # our 'ok' (a clobbered value could read as a failure upstream).
+            return {
+                'status': 'ok', 'action': 'complete_pr', 'pr_url': pr_url, 'pr_id': pr_id,
+                'pr_status': str(result.get('status') or ''),
+                'merge_status': str(result.get('merge_status') or ''),
+                'work_item_link_verified': work_item_link_verified,
+                **{k: v for k, v in approve_info.items() if k != 'status'},
+            }
 
         elif action == 'abandon_pr':
-            pr_id = context.get('outputs', {}).get(node.get('id', ''), {}).get('pr_id', '')
-            for out in context.get('outputs', {}).values():
-                if isinstance(out, dict) and out.get('pr_id'):
-                    pr_id = out['pr_id']
-                    break
-            if not pr_id:
-                return {'status': 'error', 'message': 'No PR ID found to abandon'}
-            result = await pr_service.abandon_pull_request(repo_name=repo_name, pr_id=int(pr_id))
-            return {'status': 'ok', 'action': 'abandon_pr', **result}
+            if pr_id is None:
+                return {'status': 'error', 'message': 'No PR found in flow outputs to abandon'}
+            result = await svc.abandon_pr(
+                organization_id, project=project, repo_name=repo_name, pr_id=pr_id,
+            )
+            return {'status': 'ok', 'action': 'abandon_pr', 'pr_url': pr_url, **result}
 
         return {'status': 'error', 'message': f'Unknown azure action: {action}'}
     except Exception as e:
+        logger.warning('azure_devops node failed (action=%s): %s', action, e)
         return {'status': 'error', 'message': str(e)}
 
 
@@ -1883,28 +2129,89 @@ async def _run_newrelic_node(
 
 # ── Main runner ───────────────────────────────────────────────────────────────
 
+def _restore_step_into_context(
+    node: dict[str, Any],
+    output: dict[str, Any],
+    context: dict[str, Any],
+    skip_nodes: set[str],
+) -> None:
+    """Replay a completed step's persisted output into the live context.
+
+    Used on approval-gate resume so already-executed nodes are NOT re-run:
+    their output_json is loaded back and the special context keys the
+    downstream nodes read (product_review_output / plan_output /
+    last_condition + branch skips) are reconstructed. generated_code needs
+    no special handling — _extract_generated_code derives it by scanning
+    context['outputs']."""
+    node_id = str(node.get('id') or '')
+    context['outputs'][node_id] = output
+
+    role = str(node.get('role') or '').strip().lower()
+    if role in ('product_review', 'pm', 'product_manager', 'analyzer'):
+        parsed = output.get('output')
+        context['product_review_output'] = parsed if isinstance(parsed, dict) else {}
+        raw = output.get('raw_output')
+        if raw:
+            context['product_review_raw'] = str(raw)
+    elif role == 'planner':
+        parsed = output.get('output')
+        if isinstance(parsed, dict):
+            context['plan_output'] = parsed
+
+    if str(node.get('type') or '') == 'condition':
+        context['last_condition'] = output.get('result', False)
+        branch = output.get('branch', 'true')
+        true_target = output.get('true_target', '')
+        false_target = output.get('false_target', '')
+        if branch == 'true' and false_target:
+            skip_nodes.add(false_target)
+        elif branch == 'false' and true_target:
+            skip_nodes.add(true_target)
+
+
 async def run_flow(
     flow: dict[str, Any],
     task: dict[str, Any],
     user_id: int,
     organization_id: int,
     db: AsyncSession,
+    resume_run_id: int | None = None,
 ) -> FlowRun:
-    """Flow'u çalıştırır, DB'ye kaydeder, FlowRun döndürür."""
+    """Flow'u çalıştırır, DB'ye kaydeder, FlowRun döndürür.
+
+    resume_run_id: bir onay kapısında duraklamış koşuyu devam ettirir —
+    tamamlanmış adımlar yeniden ÇALIŞTIRILMAZ (output_json'dan context'e
+    geri yüklenir), 'approved' işaretli kapı node'u bu sefer çalıştırılır.
+    """
     now = datetime.now(timezone.utc)
 
-    # FlowRun oluştur
-    flow_run = FlowRun(
-        flow_id=flow['id'],
-        flow_name=flow['name'],
-        task_id=str(task.get('id', '')),
-        task_title=task.get('title', ''),
-        user_id=user_id,
-        status='running',
-        started_at=now,
-    )
-    db.add(flow_run)
-    await db.flush()  # id al
+    prior_steps: dict[str, FlowRunStep] = {}
+    if resume_run_id:
+        flow_run = await db.get(FlowRun, resume_run_id)
+        if flow_run is None:
+            raise ValueError(f'FlowRun {resume_run_id} not found for resume')
+        if flow_run.status in ('completed', 'failed', 'cancelled', 'rejected'):
+            raise ValueError(f'FlowRun {resume_run_id} is already terminal ({flow_run.status})')
+        flow_run.status = 'running'
+        rows = (await db.execute(
+            select(FlowRunStep).where(FlowRunStep.run_id == flow_run.id).order_by(FlowRunStep.id)
+        )).scalars().all()
+        for row in rows:
+            prior_steps[row.node_id] = row  # latest row per node wins
+        await db.flush()
+    else:
+        # FlowRun oluştur
+        flow_run = FlowRun(
+            flow_id=flow['id'],
+            flow_name=flow['name'],
+            task_id=str(task.get('id', '')),
+            task_title=task.get('title', ''),
+            user_id=user_id,
+            status='running',
+            started_at=now,
+        )
+        db.add(flow_run)
+        await db.flush()  # id al
 
     nodes: list[dict[str, Any]] = flow.get('nodes', [])
     edges: list[dict[str, Any]] = flow.get('edges', [])
@@ -1919,13 +2226,23 @@ async def run_flow(
     node_map = {n['id']: n for n in ordered}
 
     # ── Boss Mode integration: set task to running + write agent logs ──
+    # task['id'] may be an EXTERNAL id (e.g. the Azure work-item number from
+    # a Sprints run) with no matching task_records row. AgentLog has an FK on
+    # task_id, so only keep it for logging when the record actually exists —
+    # otherwise the first _flow_log would blow up the whole run with an
+    # IntegrityError.
     task_id: int | None = task.get('id')
     task_record: TaskRecord | None = None
     if task_id:
-        task_record = await db.get(TaskRecord, task_id)
+        try:
+            task_record = await db.get(TaskRecord, int(str(task_id)))
+        except (TypeError, ValueError):
+            task_record = None
         if task_record:
             task_record.status = 'running'
             await db.flush()
+        else:
+            task_id = None
 
     # Role → boss-mode log message mapping (triggers correct animations)
     _ROLE_START_MSG: dict[str, str] = {
@@ -1961,12 +2278,30 @@ async def run_flow(
         ))
         await db.flush()
 
-    await _flow_log('running', f'Flow started: {flow["name"]}')
+    if resume_run_id:
+        await _flow_log('running', f'Flow resumed after approval: {flow["name"]}')
+    else:
+        await _flow_log('running', f'Flow started: {flow["name"]}')
 
     for node in ordered:
         node_id = node['id']
         node_type = node.get('type', 'agent')
         node_role = node.get('role', '').strip().lower()
+
+        prior = prior_steps.get(node_id)
+
+        # Resume: already-executed nodes are replayed from their persisted
+        # output instead of re-running (no duplicate LLM calls / PRs).
+        if prior is not None and prior.status == 'completed':
+            try:
+                prior_out = json.loads(prior.output_json or '{}')
+            except Exception:
+                prior_out = {}
+            if isinstance(prior_out, dict):
+                _restore_step_into_context(node, prior_out, context, skip_nodes)
+            continue
+        if prior is not None and prior.status == 'skipped':
+            continue
 
         # Skip nodes excluded by condition branching
         if node_id in skip_nodes:
@@ -1980,17 +2315,55 @@ async def run_flow(
             await db.flush()
             continue
 
-        step = FlowRunStep(
-            run_id=flow_run.id,
-            node_id=node_id,
-            node_type=node_type,
-            node_label=node.get('label', ''),
-            status='running',
-            input_json=json.dumps({'node': node, 'context_keys': list(context.keys())}),
-            started_at=datetime.now(timezone.utc),
-        )
-        db.add(step)
-        await db.flush()
+        # ── Approval gate: pause BEFORE executing the gated node ──────────
+        # The full {flow, task} snapshot goes into the gate step's
+        # input_json so the resume survives Redis TTL/flush and worker
+        # restarts (DB is the source of truth).
+        gate_approved = prior is not None and prior.status == 'approved'
+        if node.get('waitForApproval') and not gate_approved:
+            gate_step = FlowRunStep(
+                run_id=flow_run.id,
+                node_id=node_id,
+                node_type=node_type,
+                node_label=node.get('label', ''),
+                status='awaiting_approval',
+                input_json=json.dumps({
+                    'flow': flow,
+                    'task': task,
+                    'user_id': user_id,
+                    'organization_id': organization_id,
+                }, ensure_ascii=False, default=str),
+                started_at=datetime.now(timezone.utc),
+            )
+            db.add(gate_step)
+            flow_run.status = 'pending_approval'
+            if task_record:
+                task_record.status = 'waiting_approval'
+            await _flow_log('agent', f'Waiting for approval: {node.get("label", node_id)}')
+            await db.commit()
+            await db.refresh(flow_run)
+            return flow_run
+
+        if gate_approved:
+            # Reuse the approved gate row as this node's execution step.
+            step = prior
+            step.status = 'running'
+            step.input_json = json.dumps({'node': node, 'context_keys': list(context.keys())})
+            step.started_at = datetime.now(timezone.utc)
+            step.finished_at = None
+            await db.flush()
+        else:
+            step = FlowRunStep(
+                run_id=flow_run.id,
+                node_id=node_id,
+                node_type=node_type,
+                node_label=node.get('label', ''),
+                status='running',
+                input_json=json.dumps({'node': node, 'context_keys': list(context.keys())}),
+                started_at=datetime.now(timezone.utc),
+            )
+            db.add(step)
+            await db.flush()
 
         # Boss mode: log step start with role-appropriate message
         if node_type == 'agent':

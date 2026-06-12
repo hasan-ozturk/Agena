@@ -11,6 +11,12 @@ class RunStatus(str, enum.Enum):
     completed = 'completed'
     failed = 'failed'
     cancelled = 'cancelled'
+    # Approval-gate lifecycle (columns are plain String(20); these enums are
+    # informational): paused at a waitForApproval node → user approves →
+    # 'resuming' until the worker picks the resume job up → 'running'.
+    pending_approval = 'pending_approval'
+    resuming = 'resuming'
+    rejected = 'rejected'
 
 
 class StepStatus(str, enum.Enum):
@@ -19,6 +25,10 @@ class StepStatus(str, enum.Enum):
     completed = 'completed'
     failed = 'failed'
     skipped = 'skipped'
+    # Approval-gate states for the gated node's step row.
+    awaiting_approval = 'awaiting_approval'
+    approved = 'approved'
+    rejected = 'rejected'
 
 
 class FlowRun(Base):

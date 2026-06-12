@@ -618,6 +618,14 @@ export async function getFlowRun(runId: number): Promise<FlowRunResult> {
   return apiFetch<FlowRunResult>(`/flows/runs/${runId}`);
 }
 
+export async function approveFlowRun(runId: number): Promise<FlowRunResult> {
+  return apiFetch<FlowRunResult>(`/flows/runs/${runId}/approve`, { method: 'POST' });
+}
+
+export async function rejectFlowRun(runId: number): Promise<FlowRunResult> {
+  return apiFetch<FlowRunResult>(`/flows/runs/${runId}/reject`, { method: 'POST' });
+}
+
 export async function listFlowTemplates(): Promise<FlowTemplate[]> {
   return apiFetch<FlowTemplate[]>('/flows/templates');
 }

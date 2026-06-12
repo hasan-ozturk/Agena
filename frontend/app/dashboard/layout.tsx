@@ -51,6 +51,9 @@ const NAV_GROUPS: NavGroup[] = [
       { href: '/dashboard/sprints', key: 'nav.sprints', icon: 'sprints', permission: 'tasks:read' as const, module: 'sprints', wsPerm: 'pages:sprints' },
       { href: '/dashboard/sprint-performance', key: 'nav.sprintPerformance', icon: 'trending', permission: 'tasks:read' as const, module: 'sprints', wsPerm: 'analytics:read' },
       { href: '/dashboard/pr-reviewer', key: 'nav.prReviewer', icon: 'search', permission: 'tasks:read' as const, module: 'pr_reviewer', wsPerm: 'pages:pr_reviewer' },
+      // No `module` key: un-seeded module slugs hide items permanently, and
+      // the DevOps board is core process-tracking, not an optional module.
+      { href: '/dashboard/devops', key: 'nav.devops', icon: 'activity', permission: 'tasks:read' as const, wsPerm: 'pages:devops' },
       { href: '/dashboard/review-backlog', key: 'nav.reviewBacklog', icon: 'clock', permission: 'tasks:read' as const, module: 'review_backlog', wsPerm: 'pages:review-backlog' },
     ],
   },

@@ -113,6 +113,7 @@ PERMISSION_GROUPS: list[dict] = [
             ('pages:tasks', 'View the Tasks list'),
             ('pages:reviews', 'View the Reviews list'),
             ('pages:pr_reviewer', 'View the PR Reviewer (AI inline PR review)'),
+            ('pages:devops', 'View the DevOps Board (Azure PRs, pipelines, approvals)'),
             ('pages:refinement', 'View the Refinement page'),
             ('pages:triage', 'View the Triage inbox'),
             ('pages:review-backlog', 'View the Review Backlog'),

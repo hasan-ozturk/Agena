@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { apiFetch, loadPrefs, savePrefs, runFlow, getFlowRuns, FlowRunResult, createFlowVersion, getFlowVersion, listFlowVersions, createNotificationEvent, loadPromptCatalog } from '@/lib/api';
+import { apiFetch, loadPrefs, savePrefs, runFlow, getFlowRuns, FlowRunResult, approveFlowRun, rejectFlowRun, createFlowVersion, getFlowVersion, listFlowVersions, createNotificationEvent, loadPromptCatalog } from '@/lib/api';
 import { useLocale } from '@/lib/i18n';
 import NavIcon from '@/components/NavIcon';
 
@@ -2207,6 +2207,8 @@ const pInp: React.CSSProperties = { width: '100%', padding: '9px 12px', borderRa
 const STATUS_COLOR: Record<string, string> = {
   completed: '#3f9d6a', failed: '#cf5b57', running: '#5b9bd5',
   pending: '#c98a2b', cancelled: '#94a3b8',
+  pending_approval: '#c98a2b', awaiting_approval: '#c98a2b',
+  approved: '#3f9d6a', rejected: '#94a3b8', resuming: '#5b9bd5',
 };
 
 function RunHistoryPanel({ runs, loading, selected, onSelect, onRefresh, onClose }: {
@@ -2219,6 +2221,21 @@ function RunHistoryPanel({ runs, loading, selected, onSelect, onRefresh, onClose
 }) {
   const { t } = useLocale();
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [gateBusy, setGateBusy] = useState(false);
+  const [gateError, setGateError] = useState('');
+
+  async function handleGateDecision(runId: number, approve: boolean) {
+    setGateBusy(true); setGateError('');
+    try {
+      if (approve) await approveFlowRun(runId);
+      else await rejectFlowRun(runId);
+      onRefresh();
+    } catch (e) {
+      setGateError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGateBusy(false);
+    }
+  }
 
   function getFeedbackFlags(run: FlowRunResult) {
     const feedbackStep = run.steps.find((step) => {
@@ -2372,6 +2389,25 @@ function RunHistoryPanel({ runs, loading, selected, onSelect, onRefresh, onClose
                             {url}
                           </a>
                         ))}
+                      </div>
+                    )}
+                    {/* Approval gate: run paused — approve to continue or reject */}
+                    {run.status === 'pending_approval' && (
+                      <div style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid #c98a2b55', background: '#c98a2b10' }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: '#c98a2b', marginBottom: 8 }}>
+                          ⏸ {t('flows.awaitingApproval')}
+                        </div>
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <button onClick={() => void handleGateDecision(run.id, true)} disabled={gateBusy}
+                            style={{ flex: 1, padding: '8px 10px', borderRadius: 8, border: 'none', background: gateBusy ? 'var(--panel-border-3)' : '#3f9d6a', color: '#fff', fontWeight: 700, fontSize: 11, cursor: gateBusy ? 'not-allowed' : 'pointer' }}>
+                            {gateBusy ? '…' : `✓ ${t('flows.approveContinue')}`}
+                          </button>
+                          <button onClick={() => void handleGateDecision(run.id, false)} disabled={gateBusy}
+                            style={{ flex: 1, padding: '8px 10px', borderRadius: 8, border: '1px solid #cf5b5755', background: 'transparent', color: '#cf5b57', fontWeight: 700, fontSize: 11, cursor: gateBusy ? 'not-allowed' : 'pointer' }}>
+                            ✕ {t('flows.reject')}
+                          </button>
+                        </div>
+                        {gateError && <div style={{ fontSize: 10, color: '#cf5b57', marginTop: 6, wordBreak: 'break-word' }}>{gateError}</div>}
                       </div>
                     )}
                   </div>

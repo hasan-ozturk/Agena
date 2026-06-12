@@ -497,7 +497,7 @@ async def _run_single_task(payload: dict) -> None:
             flow_info = _json.loads(flow_data)
             flow = flow_info['flow']
             flow_user_id = flow_info.get('user_id', task.created_by_user_id)
-            await run_flow(
+            flow_run_row = await run_flow(
                 flow=flow,
                 task={
                     'id': task.id,
@@ -511,7 +511,11 @@ async def _run_single_task(payload: dict) -> None:
                 organization_id=organization_id,
                 db=session,
             )
-            await queue_service.client.delete(f'flow_def:{task_id}')
+            # Keep the flow def around while the run is paused at an
+            # approval gate (resume reads its DB snapshot, but a same-task
+            # re-run still wants this key). Delete only on terminal states.
+            if str(getattr(flow_run_row, 'status', '')) not in ('pending_approval', 'resuming'):
+                await queue_service.client.delete(f'flow_def:{task_id}')
             return
 
         # Flip the revision row to 'running' AS SOON AS we pick the
