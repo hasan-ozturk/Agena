@@ -914,6 +914,8 @@
   "sprints.selectAgent": "Agent を選択",
   "sprints.aiHint": "インポートせずに AI タスクを直接開始します。",
   "sprints.noLlmKey": "OpenAI/Gemini API key が未接続です。先に Integrations で追加してください。",
+  "sprints.flowRunningToast": "フローを実行中 — 進捗は Run History で確認できます。",
+  "sprints.viewRunHistory": "Run History を開く",
   "sprints.goIntegrationsLink": "Integrations を開く",
   "sprints.importToAgena": "AGENA にインポート",
   "sprints.openInAgena": "Agena で開く · {status}",

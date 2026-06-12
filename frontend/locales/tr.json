@@ -914,6 +914,8 @@
   "sprints.selectAgent": "Agent seç",
   "sprints.aiHint": "AI bu işi analiz edip otomatik atar",
   "sprints.noLlmKey": "LLM API key bulunamadı. Lütfen Entegrasyonlar sayfasından OpenAI veya Gemini API key ekle.",
+  "sprints.flowRunningToast": "Flow çalışıyor — durumu Run History'den izleyebilirsin.",
+  "sprints.viewRunHistory": "Run History'yi aç",
   "sprints.goIntegrationsLink": "Entegrasyonlara git",
   "sprints.importToAgena": "AGENA'ya aktar",
   "sprints.openInAgena": "Agena'da aç · {status}",

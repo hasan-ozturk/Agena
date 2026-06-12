@@ -914,6 +914,8 @@
   "sprints.selectAgent": "Selecciona agente",
   "sprints.aiHint": "Inicia AI directamente sin importar primero.",
   "sprints.noLlmKey": "OpenAI/Gemini API key no está conectado. Añádelo desde Integrations.",
+  "sprints.flowRunningToast": "El flujo está en ejecución — sigue el progreso en Run History.",
+  "sprints.viewRunHistory": "Abrir Run History",
   "sprints.goIntegrationsLink": "Abrir Integrations",
   "sprints.importToAgena": "Importar a AGENA",
   "sprints.openInAgena": "Abrir en Agena · {status}",

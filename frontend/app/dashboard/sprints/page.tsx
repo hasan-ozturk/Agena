@@ -964,6 +964,10 @@ export default function SprintsPage() {
       setTimeout(() => setFlowError(''), 6000);
       return;
     }
+    // The flow runs server-side for minutes — close the detail panel right
+    // away and surface progress via the bottom-right toast instead of
+    // pinning the user to a disabled "Flow running..." modal.
+    setSelected(null);
     setFlowRunning(true); setFlowResult(null);
     try {
       const result = await runFlow(flowId, {
@@ -1551,6 +1555,38 @@ export default function SprintsPage() {
           </div>
         </div>
       )}
+
+      {/* Flow durumu toast — panel kapalıyken koşan/biten flow'u gösterir */}
+      {(flowRunning || (flowResult && !selected)) && (() => {
+        const done = !flowRunning && flowResult;
+        const ok = done && flowResult.status !== 'failed';
+        const bg = flowRunning ? '#5b9bd5' : ok ? '#3f9d6a' : '#cf5b57';
+        return (
+          <div style={{
+            position: 'fixed', right: 20, bottom: flowError ? 110 : 20, zIndex: 9999,
+            minWidth: 280, maxWidth: 440, padding: '12px 16px', borderRadius: 10,
+            background: bg, border: `1px solid ${bg}66`,
+            boxShadow: '0 10px 30px rgba(0,0,0,0.2)',
+            fontSize: 13, color: '#fff', fontWeight: 600, lineHeight: 1.5,
+            display: 'flex', alignItems: 'center', gap: 10,
+          }}>
+            <span style={{ fontSize: 15 }}>{flowRunning ? '⟳' : ok ? '✓' : '✕'}</span>
+            <span style={{ flex: 1 }}>
+              {flowRunning
+                ? t('sprints.flowRunningToast' as TranslationKey)
+                : `${flowResult?.flow_name || 'Flow'}: ${flowResult?.status}`}
+              {' '}
+              <a href="/dashboard/flows" style={{ color: '#fff', fontSize: 12, textDecoration: 'underline' }}>
+                {t('sprints.viewRunHistory' as TranslationKey)}
+              </a>
+            </span>
+            {done && (
+              <button onClick={() => setFlowResult(null)}
+                style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.6)', cursor: 'pointer', fontSize: 16, padding: 0 }}>×</button>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }

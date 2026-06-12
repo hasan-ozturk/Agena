@@ -914,6 +914,8 @@
   "sprints.selectAgent": "选择代理",
   "sprints.aiHint": "无需导入即可直接启动 AI 任务。",
   "sprints.noLlmKey": "OpenAI/Gemini API key 未连接。请先在 Integrations 添加。",
+  "sprints.flowRunningToast": "流程正在运行 — 可在 Run History 中跟踪进度。",
+  "sprints.viewRunHistory": "打开 Run History",
   "sprints.goIntegrationsLink": "打开 Integrations 页面",
   "sprints.importToAgena": "导入到 AGENA",
   "sprints.openInAgena": "在 Agena 中打开 · {status}",
