@@ -608,6 +608,9 @@ class OrchestrationService:
                                 model=routing.preferred_agent_model,
                                 log_callback=_cli_log,
                                 task_id=str(task.id),
+                                base_ref=_cli_base_ref,
+                                remote_url=_cli_remote_url,
+                                remote_pat=_cli_remote_pat,
                                 candidate_files=candidate_files,
                             )
                 except Exception as claude_exc:
@@ -684,11 +687,31 @@ class OrchestrationService:
                     _mcp_base_ref: str | None = None
                     if revision_id and revision_assignment and revision_assignment.branch_name:
                         _mcp_base_ref = revision_assignment.branch_name
+                    elif repo_mapping and (repo_mapping.base_branch or '').strip():
+                        # Same fix as the claude_cli path: base the MCP
+                        # worktree on the mapping's branch (e.g. nopaperv3)
+                        # so the agent sees the REAL code, not master's bare
+                        # skeleton. Without this _create_worktree defaults to
+                        # origin/HEAD (master) → 27a8683 → "feature missing".
+                        _mcp_base_ref = repo_mapping.base_branch.strip()
+                    # Authenticated remote so the worktree can fetch the base.
+                    _mcp_remote_url = routing.azure_repo_url if routing.effective_source == 'azure' else None
+                    _mcp_remote_pat = None
+                    if _mcp_remote_url:
+                        try:
+                            _maz_cfg = await IntegrationConfigService(self.db_session).get_config(organization_id, 'azure')
+                            _mcp_remote_pat = _maz_cfg.secret if _maz_cfg and _maz_cfg.secret else None
+                        except Exception:
+                            _mcp_remote_pat = None
+                    logger.info('mcp_agent worktree base_ref=%s (repo_mapping=%s)',
+                                _mcp_base_ref, getattr(repo_mapping, 'base_branch', None))
                     try:
                         _mcp_worktree_path = ClaudeCLIService._create_worktree(
                             routing.local_repo_path,
                             str(task.id),
                             base_ref=_mcp_base_ref,
+                            remote_url=_mcp_remote_url,
+                            remote_pat=_mcp_remote_pat,
                         )
                     except Exception as _wt_exc:
                         # Best-effort: fall back to direct repo if worktree
@@ -1768,6 +1791,11 @@ class OrchestrationService:
             task.status = 'completed'
             task.pr_url = pr_url
             task.branch_name = branch_name
+            # Clear any stale 'answered' substatus left by an earlier run that
+            # produced only an analysis. This run made real changes + a PR, so
+            # the task-feed badge must read "Completed", not "Answered".
+            if getattr(task, 'substatus', None) == 'answered':
+                task.substatus = None
 
             # PR landed → mirror to upstream tracker (Jira / Azure).
             # Guarded on a non-empty pr_url because completion without

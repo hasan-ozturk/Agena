@@ -105,6 +105,16 @@ class ClaudeCLIService:
                     _sh.rmtree(str(wt_path), ignore_errors=True)
             except Exception:
                 pass
+        # Prune stale worktree admin entries (.git/worktrees/<name>). Across
+        # many runs these accumulate, and a leftover entry makes `git worktree
+        # add <path>` fail on the primary ref so the worktree silently lands
+        # on the wrong commit (master's bare initial commit) — the agent then
+        # runs against an empty skeleton and reports the feature as missing.
+        try:
+            subprocess.run(['git', 'worktree', 'prune'],
+                           cwd=str(repo), capture_output=True, text=True, timeout=30, env=env)
+        except Exception:
+            pass
         auth = ClaudeCLIService._auth_remote_url(remote_url, remote_pat)
         # Resolve the base branch: an explicit base_ref (the mapping's branch
         # on normal runs, or the feature branch on revisions) wins; otherwise
@@ -132,13 +142,27 @@ class ClaudeCLIService:
         # worktree to master's bare initial commit, so the agent ran against
         # an empty skeleton and hallucinated / saw the feature as "missing".
         candidates = (['FETCH_HEAD'] if fetched else []) + [f'origin/{base}', base]
+        _dbg = [f'base_ref={base_ref!r} base={base!r} auth_set={bool(remote_url and remote_pat)} fetched={fetched} wt_exists_pre={wt_path.exists()}']
         for ref in candidates:
             try:
-                subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), ref],
-                               cwd=str(repo), capture_output=True, text=True, timeout=30, env=env, check=True)
-                return str(wt_path)
-            except Exception:
-                continue
+                _r = subprocess.run(['git', 'worktree', 'add', '--detach', str(wt_path), ref],
+                               cwd=str(repo), capture_output=True, text=True, timeout=30, env=env)
+                if _r.returncode == 0:
+                    _head = subprocess.run(['git', '-C', str(wt_path), 'rev-parse', '--short', 'HEAD'],
+                                           capture_output=True, text=True, timeout=10).stdout.strip()
+                    _dbg.append(f'ref={ref!r} -> OK HEAD={_head}')
+                    try:
+                        (repo.parent / f'wt_debug_{task_id}.log').write_text('\n'.join(_dbg), encoding='utf-8')
+                    except Exception:
+                        pass
+                    return str(wt_path)
+                _dbg.append(f'ref={ref!r} -> rc={_r.returncode} err={(_r.stderr or "").strip()[:120]}')
+            except Exception as _e:
+                _dbg.append(f'ref={ref!r} -> EXC {str(_e)[:120]}')
+        try:
+            (repo.parent / f'wt_debug_{task_id}.log').write_text('\n'.join(_dbg + ['RESULT=None']), encoding='utf-8')
+        except Exception:
+            pass
         return None
 
     @staticmethod

@@ -11,6 +11,11 @@ services:
     environment:
       - CLI_BRIDGE_URL=http://cli-bridge:9876
       - ATTACHMENT_HOST_ROOT=${ATTACHMENT_HOST_ROOT:-}
+      # Windows bind mount: host .py edits don't reliably bump mtime inside
+      # the container, so Python keeps loading a STALE .pyc and code edits
+      # appear not to take effect. Disable bytecode caching so every import
+      # reads the current source.
+      - PYTHONDONTWRITEBYTECODE=1
     ports:
       - '8010:8010'
     volumes:
@@ -55,6 +60,11 @@ services:
     environment:
       - CLI_BRIDGE_URL=http://cli-bridge:9876
       - ATTACHMENT_HOST_ROOT=${ATTACHMENT_HOST_ROOT:-}
+      # Windows bind mount: host .py edits don't reliably bump mtime inside
+      # the container, so Python keeps loading a STALE .pyc and code edits
+      # appear not to take effect. Disable bytecode caching so every import
+      # reads the current source.
+      - PYTHONDONTWRITEBYTECODE=1
     volumes:
       - ./packages:/app/packages
       - ./alembic:/app/alembic
