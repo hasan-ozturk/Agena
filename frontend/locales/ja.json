@@ -1372,6 +1372,7 @@
   "tasks.status.new": "新規",
   "tasks.status.running": "実行中",
   "tasks.status.completed": "完了",
+  "tasks.status.waiting_approval": "承認待ち",
   "tasks.status.answered": "回答済み",
   "tasks.revisedBadge": "改訂済み",
   "tasks.runtime.label": "ランタイム",

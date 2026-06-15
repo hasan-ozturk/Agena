@@ -30,7 +30,7 @@ const STATUS_FILTERS = ['all', 'new', 'queued', 'running', 'completed', 'failed'
 const SOURCE_FILTERS = ['all', 'internal', 'azure', 'jira', 'newrelic', 'sentry'];
 
 function statusColor(s: string) {
-  const m: Record<string, string> = { new: '#94a3b8', queued: '#c98a2b', running: '#5b9bd5', completed: '#3f9d6a', answered: '#a78bfa', failed: '#cf5b57' };
+  const m: Record<string, string> = { new: '#94a3b8', queued: '#c98a2b', running: '#5b9bd5', completed: '#3f9d6a', answered: '#a78bfa', failed: '#cf5b57', waiting_approval: '#c98a2b' };
   return m[s] ?? '#6b7280';
 }
 

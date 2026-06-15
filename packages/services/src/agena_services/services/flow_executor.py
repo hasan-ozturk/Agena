@@ -2288,6 +2288,12 @@ async def run_flow(
         db.add(flow_run)
         await db.flush()  # id al
 
+    # Capture the PK as a plain int. We commit after every step (short
+    # transactions — see the per-node commit below), which expires ORM
+    # attributes; reading flow_run.id post-commit would trigger a lazy refresh
+    # and blow up in async context. The int is safe to read anytime.
+    flow_run_id = int(flow_run.id)
+
     nodes: list[dict[str, Any]] = flow.get('nodes', [])
     edges: list[dict[str, Any]] = flow.get('edges', [])
 
@@ -2324,7 +2330,7 @@ async def run_flow(
             organization_id=organization_id, create_if_missing=True,
         )
     except Exception:
-        logger.exception('Early task materialization failed for flow run %s', flow_run.id)
+        logger.exception('Early task materialization failed for flow run %s', flow_run_id)
         resolved_id = None
     if resolved_id is None:
         # Fallback to prior behavior: only log when task['id'] is a real record.
@@ -2341,7 +2347,11 @@ async def run_flow(
         task_id = int(task_record.id)
         if str(task_record.status) not in ('completed', 'merged', 'cancelled'):
             task_record.status = 'running'
-        await db.flush()
+        # Commit now (not just flush): the 'running' UPDATE takes a row lock on
+        # the task that would otherwise be held for the WHOLE multi-minute run,
+        # blocking any DELETE/UPDATE on it (e.g. the user deleting the task).
+        # Short transactions release it immediately.
+        await db.commit()
 
     # Role → boss-mode log message mapping (triggers correct animations)
     _ROLE_START_MSG: dict[str, str] = {
@@ -2405,7 +2415,7 @@ async def run_flow(
         # Skip nodes excluded by condition branching
         if node_id in skip_nodes:
             step = FlowRunStep(
-                run_id=flow_run.id, node_id=node_id,
+                run_id=flow_run_id, node_id=node_id,
                 node_type=node_type, node_label=node.get('label', ''),
                 status='skipped', input_json='{}',
                 started_at=datetime.now(timezone.utc), finished_at=datetime.now(timezone.utc),
@@ -2435,7 +2445,7 @@ async def run_flow(
                 await _flow_log('agent', f'Auto-approve declined → human gate: {why}')
         if node.get('waitForApproval') and not gate_approved:
             gate_step = FlowRunStep(
-                run_id=flow_run.id,
+                run_id=flow_run_id,
                 node_id=node_id,
                 node_type=node_type,
                 node_label=node.get('label', ''),
@@ -2467,7 +2477,7 @@ async def run_flow(
             await db.flush()
         else:
             step = FlowRunStep(
-                run_id=flow_run.id,
+                run_id=flow_run_id,
                 node_id=node_id,
                 node_type=node_type,
                 node_label=node.get('label', ''),
@@ -2539,7 +2549,7 @@ async def run_flow(
             if step.status == 'failed':
                 overall_status = 'failed'
                 step.finished_at = datetime.now(timezone.utc)
-                await db.flush()
+                await db.commit()
                 break
 
         except Exception as e:
@@ -2549,8 +2559,14 @@ async def run_flow(
             logger.exception('Flow step failed: %s', node_id)
             await _flow_log('agent', f'{node.get("label", node_role)} failed: {str(e)[:200]}')
 
+        # Commit per step (short transactions): persists progress durably and,
+        # critically, releases any row locks this step took (task/flow rows) so
+        # concurrent DELETE/UPDATE on the task don't block until the run ends.
+        # Also refreshes the txn snapshot each step (defends the stale-snapshot
+        # class of bug). The resume path already reads committed steps, so this
+        # is fully compatible.
         step.finished_at = datetime.now(timezone.utc)
-        await db.flush()
+        await db.commit()
 
     # Boss mode: mark flow complete
     await _flow_log('agent', 'Flow complete')

@@ -1372,6 +1372,7 @@
   "tasks.status.new": "Yeni Görev",
   "tasks.status.running": "Çalışıyor",
   "tasks.status.completed": "Tamamlandı",
+  "tasks.status.waiting_approval": "Onay Bekliyor",
   "tasks.status.answered": "Cevaplandı",
   "tasks.revisedBadge": "Revize",
   "tasks.runtime.label": "Runtime",

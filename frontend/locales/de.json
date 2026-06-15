@@ -1372,6 +1372,7 @@
   "tasks.status.new": "Neu",
   "tasks.status.running": "Läuft",
   "tasks.status.completed": "Abgeschlossen",
+  "tasks.status.waiting_approval": "Warten auf Genehmigung",
   "tasks.status.answered": "Beantwortet",
   "tasks.revisedBadge": "Überarbeitet",
   "tasks.runtime.label": "Runtime",

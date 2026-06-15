@@ -1372,6 +1372,7 @@
   "tasks.status.new": "新",
   "tasks.status.running": "运行中",
   "tasks.status.completed": "已完成",
+  "tasks.status.waiting_approval": "等待批准",
   "tasks.status.answered": "已回答",
   "tasks.revisedBadge": "已修订",
   "tasks.runtime.label": "运行环境",
