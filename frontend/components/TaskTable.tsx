@@ -28,6 +28,8 @@ export type TaskItem = {
   description: string;
   source: string;
   status: string;
+  delivery_stage?: string | null;
+  delivery_stage_label_key?: string | null;
   pr_url?: string | null;
   branch_name?: string | null;
   failure_reason?: string | null;

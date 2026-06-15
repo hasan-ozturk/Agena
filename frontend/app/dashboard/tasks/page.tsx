@@ -34,6 +34,19 @@ function statusColor(s: string) {
   return m[s] ?? '#6b7280';
 }
 
+// Derived delivery-stage chip colors. Only the pipeline-meaningful phases get a
+// separate chip in the feed (phases that just mirror task.status are skipped).
+const STAGE_PIPELINE = new Set(['developing', 'prOpen', 'inReview', 'awaitingApproval', 'merging', 'merged', 'building', 'deployed', 'blocked', 'rejected']);
+function stageColor(s?: string | null) {
+  const m: Record<string, string> = {
+    queued: '#c98a2b', analyzing: '#8b5cf6', developing: '#5b9bd5', prOpen: '#5b9bd5',
+    inReview: '#f97316', awaitingApproval: '#c98a2b', merging: '#5b9bd5', merged: '#3f9d6a',
+    building: '#5b9bd5', deployed: '#3f9d6a', completed: '#3f9d6a', failed: '#cf5b57',
+    blocked: '#cf5b57', rejected: '#94a3b8', new: '#94a3b8',
+  };
+  return (s && m[s]) || '#6b7280';
+}
+
 /** Color for an Azure/Jira work-item state shown in the sprint picker.
  * Matches loosely (substring) so custom workflows (UAT, Block, Doing…) land
  * on a sensible color regardless of exact wording / language. */
@@ -1880,6 +1893,20 @@ export default function DashboardTasksPage() {
                 {statusLabel(_eff, t)}
               </span>
               ); })()}
+              {task.delivery_stage && task.delivery_stage_label_key && STAGE_PIPELINE.has(task.delivery_stage) && (
+                <span
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 700,
+                    background: `${stageColor(task.delivery_stage)}14`,
+                    border: `1px solid ${stageColor(task.delivery_stage)}40`,
+                    color: stageColor(task.delivery_stage), width: 'fit-content',
+                  }}
+                >
+                  <NavIcon name="activity" size={11} />
+                  {t(task.delivery_stage_label_key as TranslationKey)}
+                </span>
+              )}
               <div>
                 <span style={{ fontSize: 12, color: 'var(--ink-65)', fontWeight: 600 }}>{fmtDuration(task.run_duration_sec ?? task.duration_sec)}</span>
               </div>

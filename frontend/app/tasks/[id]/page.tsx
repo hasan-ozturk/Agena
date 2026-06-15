@@ -192,6 +192,39 @@ function utcZ(s?: string | null): string {
   return /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z';
 }
 
+// Pipeline tab (delivery run) display helpers.
+function runStageColor(s?: string | null): string {
+  const m: Record<string, string> = {
+    queued: '#c98a2b', analyzing: '#8b5cf6', developing: '#5b9bd5', prOpen: '#5b9bd5',
+    inReview: '#f97316', awaitingApproval: '#c98a2b', merging: '#5b9bd5', merged: '#3f9d6a',
+    building: '#5b9bd5', deployed: '#3f9d6a', completed: '#3f9d6a', failed: '#cf5b57',
+    blocked: '#cf5b57', rejected: '#94a3b8', new: '#94a3b8',
+  };
+  return (s && m[s]) || '#6b7280';
+}
+function stepStatusColor(s?: string | null): string {
+  const m: Record<string, string> = {
+    completed: '#3f9d6a', approved: '#3f9d6a', failed: '#cf5b57', rejected: '#cf5b57',
+    running: '#5b9bd5', awaiting_approval: '#c98a2b', pending: '#94a3b8', skipped: '#94a3b8',
+  };
+  return (s && m[s]) || '#6b7280';
+}
+function stepStatusIcon(s?: string | null): string {
+  const m: Record<string, string> = {
+    completed: '✓', approved: '✓', failed: '✗', rejected: '✗',
+    running: '◌', awaiting_approval: '⏸', pending: '○', skipped: '–',
+  };
+  return (s && m[s]) || '•';
+}
+function fmtStepDuration(a?: string | null, b?: string | null): string {
+  if (!a || !b) return '';
+  const ms = new Date(utcZ(b)).getTime() - new Date(utcZ(a)).getTime();
+  if (!isFinite(ms) || ms < 0) return '';
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+}
+
 function indexingProgress(logs: { stage: string; message: string; created_at?: string }[]): { active: boolean; done: number; total: number } | null {
   for (let i = logs.length - 1; i >= 0; i -= 1) {
     const l = logs[i];
@@ -377,7 +410,11 @@ export default function TaskDetailPage() {
   const [jiraBaseUrl, setJiraBaseUrl] = useState('');
   const [linkWorkItemInput, setLinkWorkItemInput] = useState('');
   const [linkBusy, setLinkBusy] = useState(false);
-  const [rightTab, setRightTab] = useState<'activity' | 'agent' | 'steps' | 'memory' | 'diff' | 'logs' | 'reviews'>('activity');
+  const [rightTab, setRightTab] = useState<'activity' | 'agent' | 'steps' | 'memory' | 'diff' | 'logs' | 'reviews' | 'pipeline'>('activity');
+  const [runData, setRunData] = useState<any | null>(null);
+  const [runLoading, setRunLoading] = useState(false);
+  const [runExpanded, setRunExpanded] = useState<Record<string, boolean>>({});
+  const [runActing, setRunActing] = useState(false);
 
   type ReviewRow = { id: number; reviewer_agent_role: string; reviewer_model: string | null; output: string | null; score: number | null; findings_count: number | null; severity: string | null; status: string; created_at: string };
   const [reviews, setReviews] = useState<ReviewRow[]>([]);
@@ -659,6 +696,49 @@ export default function TaskDetailPage() {
         .catch(() => { /* keep fallback */ })
     );
   }, [rightTab, taskId]);
+
+  // Pipeline tab: load the unified delivery run; poll while non-terminal.
+  useEffect(() => {
+    if (rightTab !== 'pipeline' || !taskId) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const TERMINAL = new Set(['completed', 'merged', 'deployed', 'failed', 'rejected']);
+    const load = async (showSpinner: boolean) => {
+      if (showSpinner) setRunLoading(true);
+      try {
+        const d = await apiFetch<any>(`/devops/run/${taskId}`);
+        if (cancelled) return;
+        setRunData(d);
+        if (!TERMINAL.has(d?.derived_status)) timer = setTimeout(() => load(false), 4000);
+      } catch { /* keep last */ } finally {
+        if (!cancelled && showSpinner) setRunLoading(false);
+      }
+    };
+    void load(true);
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [rightTab, taskId]);
+
+  const refetchRun = async () => {
+    if (!taskId) return;
+    try { setRunData(await apiFetch<any>(`/devops/run/${taskId}`)); } catch { /* keep last */ }
+  };
+  const onFlowGate = async (runId: number, approve: boolean) => {
+    setRunActing(true);
+    try {
+      await apiFetch(`/flows/runs/${runId}/${approve ? 'approve' : 'reject'}`, { method: 'POST' });
+      await refetchRun();
+    } catch { /* surfaced via re-fetch */ } finally { setRunActing(false); }
+  };
+  const onPipelineApproval = async (appr: any, approve: boolean) => {
+    setRunActing(true);
+    try {
+      await apiFetch(`/devops/approvals/${appr.id}/${approve ? 'approve' : 'reject'}`, {
+        method: 'POST',
+        body: JSON.stringify({ project: appr.project, expected_build_id: appr.expected_build_id || 0, comment: '' }),
+      });
+      await refetchRun();
+    } catch { /* surfaced via re-fetch */ } finally { setRunActing(false); }
+  };
 
   useEffect(() => {
     if (!taskId) return;
@@ -1844,6 +1924,7 @@ export default function TaskDetailPage() {
               { id: 'activity', label: '⚡ ' + (t('taskDetail.activityTab' as never) || 'Activity') },
               { id: 'agent', label: '🤖 ' + (t('taskDetail.liveLogs') || 'Agent') },
               { id: 'steps', label: '⚙ ' + (t('taskDetail.executionSteps') || 'Steps') },
+              { id: 'pipeline', label: '🔗 ' + (t('runDetail.tab' as never) || 'Pipeline') },
               ...(reviewsEnabled ? [{ id: 'reviews', label: '🔎 ' + (t('reviews.title') || 'Reviews') }] : []),
               { id: 'memory', label: '🧠 ' + (t('taskDetail.memoryImpact') || 'Memory') },
               { id: 'diff', label: '📝 ' + (t('taskDetail.codeDiffPreview') || 'Diff') },
@@ -2281,6 +2362,118 @@ export default function TaskDetailPage() {
                   </div>
                 ) : null}
               </div>
+            )}
+          </section>
+          )}
+
+          {rightTab === 'pipeline' && (
+          <section style={{ borderRadius: 16, border: '1px solid var(--panel-border-2)', background: 'var(--panel)', padding: 16, minHeight: 300 }}>
+            {runLoading && !runData ? (
+              <div style={{ fontSize: 13, color: 'var(--ink-50)' }}>{t('runDetail.loading' as TranslationKey) || 'Loading…'}</div>
+            ) : !runData || runData.resolved === false ? (
+              <div style={{ fontSize: 13, color: 'var(--ink-50)' }}>{t('runDetail.empty' as TranslationKey) || 'No pipeline data for this task yet.'}</div>
+            ) : (
+              <>
+                {/* Header: derived status + WI / PR links */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+                  {runData.derived_status_label_key && (
+                    <span style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 12px', borderRadius: 999,
+                      fontSize: 12, fontWeight: 800, background: `${runStageColor(runData.derived_status)}18`,
+                      border: `1px solid ${runStageColor(runData.derived_status)}40`, color: runStageColor(runData.derived_status),
+                    }}>{t(runData.derived_status_label_key as TranslationKey)}</span>
+                  )}
+                  {runData.work_item?.url && (
+                    <a href={runData.work_item.url} target="_blank" rel="noreferrer" style={{ fontSize: 12, fontWeight: 600, color: 'var(--brand)' }}>
+                      WI #{runData.work_item.id} ↗
+                    </a>
+                  )}
+                  {runData.pr?.url && (
+                    <a href={runData.pr.url} target="_blank" rel="noreferrer" style={{ fontSize: 12, fontWeight: 600, color: 'var(--brand)' }}>
+                      PR #{runData.pr.id}{runData.pr.status ? ` · ${runData.pr.status}` : ''} ↗
+                    </a>
+                  )}
+                </div>
+
+                {/* Flow steps spine */}
+                {Array.isArray(runData.flow_steps) && runData.flow_steps.length > 0 && (
+                  <div style={{ marginBottom: 18 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.8, color: 'var(--ink-45)', marginBottom: 8 }}>{t('runDetail.flowSteps' as TranslationKey) || 'Flow steps'}</div>
+                    {runData.flow_steps.map((s: any, i: number) => (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 0', borderBottom: i < runData.flow_steps.length - 1 ? '1px solid var(--panel-border)' : 'none' }}>
+                        <span style={{ width: 18, textAlign: 'center', color: stepStatusColor(s.status), fontWeight: 800 }}>{stepStatusIcon(s.status)}</span>
+                        <span style={{ flex: 1, fontSize: 13, color: 'var(--ink-85)', fontWeight: 600 }}>{s.node_label || s.node_type}</span>
+                        {s.status === 'awaiting_approval' && runData.flow_run?.id && (
+                          <span style={{ display: 'inline-flex', gap: 6 }}>
+                            <button disabled={runActing} onClick={() => onFlowGate(runData.flow_run.id, true)} style={{ padding: '3px 10px', borderRadius: 7, border: 'none', background: '#3f9d6a', color: '#fff', fontSize: 11, fontWeight: 700, cursor: runActing ? 'default' : 'pointer' }}>{t('flows.approve' as TranslationKey) || 'Approve'}</button>
+                            <button disabled={runActing} onClick={() => onFlowGate(runData.flow_run.id, false)} style={{ padding: '3px 10px', borderRadius: 7, border: '1px solid #cf5b57', background: 'transparent', color: '#cf5b57', fontSize: 11, fontWeight: 700, cursor: runActing ? 'default' : 'pointer' }}>{t('flows.reject' as TranslationKey) || 'Reject'}</button>
+                          </span>
+                        )}
+                        {s.error_msg && <span style={{ fontSize: 11, color: '#cf5b57', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={s.error_msg}>{s.error_msg}</span>}
+                        <span style={{ fontSize: 11, color: 'var(--ink-45)', minWidth: 48, textAlign: 'right' }}>{fmtStepDuration(s.started_at, s.finished_at)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Review */}
+                {runData.review && (
+                  <div style={{ marginBottom: 18 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.8, color: 'var(--ink-45)', marginBottom: 8 }}>{t('reviews.title') || 'Review'}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: runData.review.output ? 'pointer' : 'default' }} onClick={() => runData.review.output && setRunExpanded((p) => ({ ...p, review: !p.review }))}>
+                      <span style={{ fontSize: 12, fontWeight: 800, color: (runData.review.score ?? 0) >= 80 ? '#3f9d6a' : '#c98a2b' }}>{runData.review.score ?? '—'}/100</span>
+                      {runData.review.severity && <span style={{ fontSize: 11, fontWeight: 700, color: runData.review.severity === 'low' || runData.review.severity === 'clean' ? '#3f9d6a' : runData.review.severity === 'critical' || runData.review.severity === 'high' ? '#cf5b57' : '#c98a2b' }}>{runData.review.severity}</span>}
+                      <span style={{ fontSize: 11, color: 'var(--ink-45)' }}>{runData.review.reviewer}{typeof runData.review.findings_count === 'number' ? ` · ${runData.review.findings_count} findings` : ''}</span>
+                      {runData.review.output && <span style={{ fontSize: 11, color: 'var(--brand)', marginLeft: 'auto' }}>{runExpanded.review ? '▾' : '▸'}</span>}
+                    </div>
+                    {runExpanded.review && runData.review.output && (
+                      <div className='rich-md' style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--ink-80)', marginTop: 10, maxHeight: 360, overflowY: 'auto', wordBreak: 'break-word' }} dangerouslySetInnerHTML={{ __html: renderMarkdown(String(runData.review.output)) }} />
+                    )}
+                  </div>
+                )}
+
+                {/* CI builds */}
+                {Array.isArray(runData.builds) && runData.builds.length > 0 && (
+                  <div style={{ marginBottom: 18 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.8, color: 'var(--ink-45)', marginBottom: 8 }}>{t('runDetail.builds' as TranslationKey) || 'Pipeline builds'}</div>
+                    {runData.builds.map((b: any, i: number) => {
+                      const ok = (b.result || '').toLowerCase() === 'succeeded';
+                      const inprog = (b.status || '').toLowerCase() === 'inprogress' || (b.status || '').toLowerCase() === 'notstarted';
+                      const col = ok ? '#3f9d6a' : inprog ? '#5b9bd5' : (b.result ? '#cf5b57' : '#94a3b8');
+                      return (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0' }}>
+                          <span style={{ width: 8, height: 8, borderRadius: '50%', background: col }} />
+                          <span style={{ flex: 1, fontSize: 13, color: 'var(--ink-85)' }}>{b.definition_name || b.repository_name || `Build ${b.id}`}</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: col }}>{b.result || b.status || ''}</span>
+                          {b.web_url && <a href={b.web_url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: 'var(--brand)' }}>#{b.id} ↗</a>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Pipeline deploy approval (KNOWN → actionable) */}
+                {runData.approval && (
+                  <div style={{ marginBottom: 6, padding: 12, borderRadius: 10, border: '1px solid var(--panel-border)', background: 'var(--panel-alt)' }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.8, color: 'var(--ink-45)', marginBottom: 8 }}>{t('runDetail.deployApproval' as TranslationKey) || 'Deploy approval'}</div>
+                    <div style={{ fontSize: 12, color: 'var(--ink-75)', marginBottom: 10 }}>{runData.approval.instructions_summary || `Build ${runData.approval.expected_build_id}`}</div>
+                    {runData.approval.classification === 'known' ? (
+                      <div style={{ display: 'inline-flex', gap: 8 }}>
+                        <button disabled={runActing} onClick={() => onPipelineApproval(runData.approval, true)} style={{ padding: '5px 14px', borderRadius: 8, border: 'none', background: '#3f9d6a', color: '#fff', fontSize: 12, fontWeight: 700, cursor: runActing ? 'default' : 'pointer' }}>{t('flows.approve' as TranslationKey) || 'Approve'}</button>
+                        <button disabled={runActing} onClick={() => onPipelineApproval(runData.approval, false)} style={{ padding: '5px 14px', borderRadius: 8, border: '1px solid #cf5b57', background: 'transparent', color: '#cf5b57', fontSize: 12, fontWeight: 700, cursor: runActing ? 'default' : 'pointer' }}>{t('flows.reject' as TranslationKey) || 'Reject'}</button>
+                      </div>
+                    ) : (
+                      <span style={{ fontSize: 11, color: 'var(--ink-45)' }}>🔒 {runData.approval.reason || runData.approval.classification}</span>
+                    )}
+                  </div>
+                )}
+
+                {Array.isArray(runData.errors) && runData.errors.length > 0 && (
+                  <div style={{ fontSize: 11, color: '#c98a2b', marginTop: 8 }}>
+                    {t('runDetail.partial' as TranslationKey) || 'Some live sections could not be loaded:'} {runData.errors.map((e: any) => e.section).join(', ')}
+                  </div>
+                )}
+              </>
             )}
           </section>
           )}

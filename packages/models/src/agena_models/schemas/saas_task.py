@@ -50,6 +50,10 @@ class TaskResponse(BaseModel):
     occurrences: int | None = None
     external_work_item_id: str | None = None
     status: str
+    # Derived single high-level delivery phase (Tasks feed badge). label_key is
+    # an i18n key the frontend translates.
+    delivery_stage: str | None = None
+    delivery_stage_label_key: str | None = None
     pr_url: str | None = None
     branch_name: str | None = None
     failure_reason: str | None = None

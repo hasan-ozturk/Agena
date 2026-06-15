@@ -20,6 +20,7 @@ from agena_services.services.devops_board_service import (
     ApprovalMismatchError,
     act_on_approval,
     build_board,
+    build_run_for_task,
     list_pipelines_for_mapping,
 )
 
@@ -51,6 +52,22 @@ async def get_board(
         organization_id=tenant.organization_id,
         user_id=tenant.user_id,
         days=days,
+    )
+
+
+@router.get('/run/{task_id}')
+async def get_run(
+    task_id: int,
+    tenant: CurrentTenant = Depends(require_permission('tasks:read')),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Single-pane delivery run for one task (Pipeline tab): flow steps + review
+    + PR/merge + SHA-matched builds + pipeline approval + derived status."""
+    return await build_run_for_task(
+        db,
+        organization_id=tenant.organization_id,
+        user_id=tenant.user_id,
+        task_id=task_id,
     )
 
 

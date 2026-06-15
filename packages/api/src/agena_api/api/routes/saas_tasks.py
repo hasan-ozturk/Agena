@@ -190,7 +190,51 @@ async def _import_external_attachments_for_task(
     )
 
 
-async def _to_task_response(service: TaskService, organization_id: int, task) -> TaskResponse:
+async def _compute_delivery_stages(db, organization_id: int, tasks) -> dict[int, tuple[str, str]]:
+    """Batch-compute the derived delivery stage for a list of tasks (DB-only,
+    no Azure) — one query for latest reviews, one for latest flow runs. Used by
+    the Tasks feed to avoid N+1."""
+    from agena_services.services.delivery_stage import compute_delivery_stage
+    from agena_models.models.task_review import TaskReview
+    from agena_models.models.flow_run import FlowRun
+    ids = [t.id for t in tasks]
+    if not ids:
+        return {}
+    rev_by_task: dict[int, tuple] = {}
+    for tid, st, sev in (await db.execute(
+        select(TaskReview.task_id, TaskReview.status, TaskReview.severity)
+        .where(TaskReview.task_id.in_(ids), TaskReview.organization_id == organization_id)
+        .order_by(TaskReview.id.desc())
+    )).all():
+        rev_by_task.setdefault(int(tid), (st, sev))
+    fr_by_task: dict[int, str] = {}
+    for tid_s, st in (await db.execute(
+        select(FlowRun.task_id, FlowRun.status)
+        .where(FlowRun.task_id.in_([str(i) for i in ids]))
+        .order_by(FlowRun.id.desc())
+    )).all():
+        try:
+            fr_by_task.setdefault(int(tid_s), st)
+        except (TypeError, ValueError):
+            continue
+    out: dict[int, tuple[str, str]] = {}
+    for t in tasks:
+        rev = rev_by_task.get(t.id)
+        out[t.id] = compute_delivery_stage(
+            task_status=t.status,
+            task_substatus=getattr(t, 'substatus', None),
+            pr_url=t.pr_url,
+            review_status=rev[0] if rev else None,
+            review_severity=rev[1] if rev else None,
+            flow_run_status=fr_by_task.get(t.id),
+        )
+    return out
+
+
+async def _to_task_response(
+    service: TaskService, organization_id: int, task,
+    *, delivery_stage: str | None = None, delivery_stage_label_key: str | None = None,
+) -> TaskResponse:
     insights = await service.get_task_insights(organization_id, task)
     preferred_agent_model, preferred_agent_provider = service._extract_preferred_agent_selection(task.description)
 
@@ -218,10 +262,20 @@ async def _to_task_response(service: TaskService, organization_id: int, task) ->
         for a, m in assign_rows
     ]
 
+    # Single-task path (detail endpoint) — compute the stage inline if the
+    # caller (the feed) didn't already batch it.
+    if delivery_stage is None and delivery_stage_label_key is None:
+        _stages = await _compute_delivery_stages(service.db, organization_id, [task])
+        _ds = _stages.get(task.id)
+        if _ds:
+            delivery_stage, delivery_stage_label_key = _ds
+
     return TaskResponse(
         id=task.id,
         title=task.title,
         description=task.description,
+        delivery_stage=delivery_stage,
+        delivery_stage_label_key=delivery_stage_label_key,
         preferred_agent_model=preferred_agent_model,
         preferred_agent_provider=preferred_agent_provider,
         story_context=task.story_context,
@@ -437,9 +491,14 @@ async def list_tasks(
 ) -> list[TaskResponse]:
     service = TaskService(db)
     tasks = await service.list_tasks(tenant.organization_id)
+    stages = await _compute_delivery_stages(db, tenant.organization_id, tasks)
     response: list[TaskResponse] = []
     for t in tasks:
-        response.append(await _to_task_response(service, tenant.organization_id, t))
+        ds = stages.get(t.id) or (None, None)
+        response.append(await _to_task_response(
+            service, tenant.organization_id, t,
+            delivery_stage=ds[0], delivery_stage_label_key=ds[1],
+        ))
     return response
 
 
@@ -477,9 +536,14 @@ async def search_tasks(
         page=page,
         page_size=page_size,
     )
+    stages = await _compute_delivery_stages(db, tenant.organization_id, tasks)
     items: list[TaskResponse] = []
     for t in tasks:
-        items.append(await _to_task_response(service, tenant.organization_id, t))
+        ds = stages.get(t.id) or (None, None)
+        items.append(await _to_task_response(
+            service, tenant.organization_id, t,
+            delivery_stage=ds[0], delivery_stage_label_key=ds[1],
+        ))
     return TaskListResponse(items=items, total=total, page=page, page_size=page_size)
 
 

@@ -518,6 +518,191 @@ async def _build_board_inner(
     }
 
 
+async def build_run_for_task(
+    db: AsyncSession,
+    *,
+    organization_id: int,
+    user_id: int,
+    task_id: int,
+) -> dict[str, Any]:
+    """Single-pane delivery run for ONE task: flow steps (orchestration spine)
+    + AI review + PR/merge + SHA-matched CI builds + the matching pipeline
+    deploy approval + a derived delivery status. Reuses the board's leaf helpers
+    (no _build_board_inner change → board stays byte-identical). Section-failure
+    tolerant — a dead Azure section drops to errors[] and never 500s.
+
+    The frontend composes the vertical timeline from these sections; flow_steps
+    is the spine (analyze/develop/review/pr/merge nodes), augmented by the live
+    pr/review/builds/approval sections."""
+    from agena_services.services.delivery_stage import compute_delivery_stage
+    from agena_models.models.flow_run import FlowRun, FlowRunStep
+
+    errors: list[dict[str, str]] = []
+    task = await db.get(TaskRecord, task_id)
+    if task is None or task.organization_id != organization_id:
+        return {'resolved': False, 'error': 'task not found', 'errors': errors}
+
+    # ── DB sections (always available) ───────────────────────────────────
+    review_rows = (await db.execute(
+        select(TaskReview)
+        .where(TaskReview.task_id == task_id, TaskReview.organization_id == organization_id)
+        .order_by(TaskReview.id.desc())
+    )).scalars().all()
+    reviews = [{
+        'id': r.id, 'score': r.score, 'severity': r.severity, 'status': r.status,
+        'reviewer': r.reviewer_agent_role, 'findings_count': r.findings_count,
+        'output': r.output, 'created_at': r.created_at.isoformat() if r.created_at else None,
+        'completed_at': r.completed_at.isoformat() if r.completed_at else None,
+    } for r in review_rows]
+    review = reviews[0] if reviews else None
+
+    # FlowRun: new runs store the INTERNAL id; legacy/sprint runs the external WI.
+    fr = (await db.execute(
+        select(FlowRun).where(FlowRun.task_id == str(task_id)).order_by(FlowRun.id.desc())
+    )).scalars().first()
+    if fr is None and getattr(task, 'external_work_item_id', None):
+        fr = (await db.execute(
+            select(FlowRun).where(FlowRun.task_id == str(task.external_work_item_id)).order_by(FlowRun.id.desc())
+        )).scalars().first()
+    flow_run: dict[str, Any] | None = None
+    flow_steps: list[dict[str, Any]] = []
+    if fr is not None:
+        flow_run = {'id': fr.id, 'flow_name': fr.flow_name, 'status': fr.status,
+                    'started_at': fr.started_at.isoformat() if fr.started_at else None,
+                    'finished_at': fr.finished_at.isoformat() if fr.finished_at else None}
+        steps = (await db.execute(
+            select(FlowRunStep).where(FlowRunStep.run_id == fr.id).order_by(FlowRunStep.id)
+        )).scalars().all()
+        flow_steps = [{
+            'node_id': s.node_id, 'node_type': s.node_type, 'node_label': s.node_label,
+            'status': s.status, 'error_msg': s.error_msg,
+            'started_at': s.started_at.isoformat() if s.started_at else None,
+            'finished_at': s.finished_at.isoformat() if s.finished_at else None,
+        } for s in steps]
+
+    # ── Live Azure sections (best-effort) ─────────────────────────────────
+    pr: dict[str, Any] | None = None
+    builds_matched: list[dict[str, Any]] = []
+    work_item: dict[str, Any] | None = None
+    approval: dict[str, Any] | None = None
+    cfg = await _azure_cfg(db, organization_id)
+    if cfg is not None:
+        wid = _resolve_work_item_id(task)
+        mapping_name = _resolve_mapping_name(task)
+        mapping: dict[str, Any] | None = None
+        for uid in [int(task.created_by_user_id or 0), user_id]:
+            if not uid:
+                continue
+            for entry in await load_prefs_mappings(db, uid):
+                norm = normalize_mapping(entry)
+                if norm and (not mapping_name or norm['name'] == mapping_name):
+                    mapping = norm
+                    break
+            if mapping:
+                break
+        client = AzureDevOpsClient()
+        from agena_services.services.azure_pr_service import AzurePRService
+        pr_svc = AzurePRService(db)
+        if mapping:
+            try:
+                rid = await client.get_repository_id(cfg=cfg, project=mapping['project'], repo=mapping['repo_name'])
+                if rid:
+                    mapping['repo_id'] = rid
+            except Exception as exc:
+                errors.append({'section': 'repo', 'error': str(exc)[:200]})
+        project = mapping['project'] if mapping else ''
+
+        async def _get_pr() -> dict[str, Any] | None:
+            ref = pr_svc._parse_pr_ref(task.pr_url or '')
+            if ref is None:
+                return None
+            p, r, pid = ref
+            return await client.get_pull_request(cfg=cfg, project=p, repo=r, pr_id=pid)
+
+        async def _get_builds() -> list[dict[str, Any]]:
+            if not mapping:
+                return []
+            bl = await client.list_builds(cfg=cfg, project=mapping['project'], top=25)
+            return [b for b in bl if classify_build(b, [mapping])['classification'] == 'known']
+
+        async def _get_wi() -> dict[str, Any]:
+            if not wid or not project:
+                return {}
+            return await client.get_work_items_batch(cfg=cfg, project=project, ids=[wid])
+
+        async def _get_approvals() -> list[dict[str, Any]]:
+            if not project:
+                return []
+            return await client.list_pending_approvals(cfg=cfg, project=project)
+
+        pr_r, builds_r, wi_r, appr_r = await asyncio.gather(
+            _get_pr(), _get_builds(), _get_wi(), _get_approvals(), return_exceptions=True,
+        )
+        for name, val in (('pr', pr_r), ('builds', builds_r), ('work_items', wi_r), ('approvals', appr_r)):
+            if isinstance(val, Exception):
+                errors.append({'section': name, 'error': str(val)[:200]})
+        pr = None if isinstance(pr_r, Exception) else pr_r
+        own_builds = [] if isinstance(builds_r, Exception) else (builds_r or [])
+        wi_map = {} if isinstance(wi_r, Exception) else (wi_r or {})
+        raw_approvals = [] if isinstance(appr_r, Exception) else (appr_r or [])
+        builds_matched = _match_builds_to_pr(pr, own_builds)
+        work_item = (wi_map or {}).get(wid) or ({'id': wid, 'title': '', 'state': '', 'type': '', 'url': ''} if wid else None)
+
+        # Pipeline deploy approval for THIS run: the pending approval whose Build
+        # ID matches one of this run's builds (KNOWN → actionable). Others ignored.
+        run_build_ids = {str(b.get('id')) for b in own_builds}
+        for a in raw_approvals[:50]:
+            bid = parse_build_id_from_instructions(a.get('instructions'))
+            if bid is not None and str(bid) in run_build_ids:
+                build = None
+                try:
+                    build = await client.get_build(cfg=cfg, project=project, build_id=bid)
+                except Exception as exc:
+                    errors.append({'section': 'approval_build', 'error': str(exc)[:200]})
+                cls = classify_build(build, [mapping] if mapping else [])
+                approval = {
+                    'id': a.get('id'), 'project': project,
+                    'created_on': a.get('created_on'),
+                    'instructions_summary': str(a.get('instructions') or '')[:280],
+                    'expected_build_id': bid, 'build': build, **cls,
+                }
+                break
+
+    # ── Derived delivery status (DB + live signals) ──────────────────────
+    top_build = builds_matched[0] if builds_matched else None
+    phase, label_key = compute_delivery_stage(
+        task_status=task.status,
+        task_substatus=getattr(task, 'substatus', None),
+        pr_url=task.pr_url,
+        review_status=(review or {}).get('status'),
+        review_severity=(review or {}).get('severity'),
+        flow_run_status=(flow_run or {}).get('status'),
+        pr_merge_status=(pr or {}).get('merge_status'),
+        pr_status=(pr or {}).get('status'),
+        build_result=(top_build or {}).get('result'),
+        build_status=(top_build or {}).get('status'),
+        approval_pending=bool(approval and approval.get('classification') == 'known'),
+    )
+
+    return {
+        'resolved': True,
+        'task': {'id': task.id, 'title': task.title, 'status': task.status,
+                 'substatus': getattr(task, 'substatus', None), 'pr_url': task.pr_url,
+                 'failure_reason': task.failure_reason},
+        'work_item': work_item,
+        'flow_run': flow_run,
+        'flow_steps': flow_steps,
+        'pr': pr,
+        'review': review,
+        'reviews': reviews,
+        'builds': builds_matched,
+        'approval': approval,
+        'derived_status': phase,
+        'derived_status_label_key': label_key,
+        'errors': errors,
+    }
+
+
 # ── Guarded approval action ──────────────────────────────────────────────────
 
 async def act_on_approval(
