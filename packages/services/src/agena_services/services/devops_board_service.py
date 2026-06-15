@@ -77,7 +77,9 @@ def find_mapping_by_name(mappings: list[dict[str, Any]], name: str | None) -> di
 
 
 def normalize_mapping(entry: dict[str, Any]) -> dict[str, Any] | None:
-    """Prefs entry → board-shape mapping {name, project, repo_name, default_branch}."""
+    """Prefs entry → board-shape mapping. Carries the explicit pipeline
+    allowlist (`pipeline_definitions` set in the mapping editor) when present
+    — that is the most precise binding; repo_id/name are fallbacks."""
     provider = str(entry.get('provider') or '').strip().lower()
     if provider and provider != 'azure':
         return None
@@ -85,12 +87,20 @@ def normalize_mapping(entry: dict[str, Any]) -> dict[str, Any] | None:
     repo_name = str(entry.get('azure_repo_name') or entry.get('repo_name') or '').strip()
     if not project or not repo_name:
         return None
+    pipeline_defs: list[int] = []
+    for d in (entry.get('pipeline_definitions') or []):
+        try:
+            pipeline_defs.append(int(d.get('id') if isinstance(d, dict) else d))
+        except (TypeError, ValueError):
+            continue
     return {
         'id': str(entry.get('id') or ''),
         'name': str(entry.get('name') or ''),
         'project': project,
         'repo_name': repo_name,
         'default_branch': str(entry.get('default_branch') or entry.get('base_branch') or '').strip() or 'main',
+        'pipeline_definition_ids': pipeline_defs,   # explicit allowlist (may be empty)
+        'repo_id': '',                              # filled lazily by build_board
     }
 
 
@@ -112,30 +122,55 @@ def classify_build(
 ) -> dict[str, Any]:
     """Classify an approval's underlying build against the known repo set.
 
-    Returns {'classification': 'known'|'foreign'|'unresolved',
-             'reason': str, 'known_via': str|None, 'mapping_name': str|None}.
-    Repository identity is the primary, deterministic rule; definition-name
-    prefix is a fallback when the build payload lacks repository info.
+    Precedence (most → least precise):
+      1. explicit allowlist — build's definition id is in the mapping's
+         `pipeline_definition_ids` (user-selected in the mapping editor)
+      2. repo GUID — build.repository_id == mapping.repo_id (deterministic)
+      3. repo name — build.repository_name == mapping.repo_name
+      4. definition-name prefix — only when the build lacks repository info
+    Returns {'classification', 'reason', 'known_via', 'mapping_name'}.
     """
     if not build_meta:
         return {'classification': 'unresolved', 'reason': 'build could not be resolved from the approval',
                 'known_via': None, 'mapping_name': None}
 
+    def_id = int(build_meta.get('definition_id') or 0)
+    repo_id = str(build_meta.get('repository_id') or '').strip().lower()
     repo_name = str(build_meta.get('repository_name') or '').strip().lower()
     project_name = str(build_meta.get('project_name') or '').strip().lower()
     definition = str(build_meta.get('definition_name') or '').strip()
 
+    # Per-mapping, allowlist-strict: a mapping WITH an explicit pipeline
+    # allowlist owns a build ONLY via that allowlist (its repo/name/prefix
+    # fallbacks are intentionally NOT consulted — the user narrowed it on
+    # purpose, e.g. selecting only NoPaper-Api). A mapping WITHOUT an
+    # allowlist auto-discovers by repo GUID → repo name.
     for m in mappings:
+        allow = set(m.get('pipeline_definition_ids') or [])
+        if allow:
+            if def_id and def_id in allow:
+                return {'classification': 'known',
+                        'reason': f'matched selected pipeline: {definition or def_id}',
+                        'known_via': 'allowlist', 'mapping_name': m.get('name')}
+            continue  # strict: do not fall back to repo identity for this mapping
+        m_repo_id = str(m.get('repo_id') or '').strip().lower()
+        if m_repo_id and repo_id and repo_id == m_repo_id:
+            return {'classification': 'known',
+                    'reason': f'matched repo: {m.get("repo_name")}',
+                    'known_via': 'repository_id', 'mapping_name': m.get('name')}
         m_repo = str(m.get('repo_name') or '').strip().lower()
         m_proj = str(m.get('project') or '').strip().lower()
-        if not m_repo:
-            continue
-        if repo_name and repo_name == m_repo and (not project_name or not m_proj or project_name == m_proj):
+        if m_repo and repo_name and repo_name == m_repo and (not project_name or not m_proj or project_name == m_proj):
             return {'classification': 'known',
                     'reason': f'matched repo: {m.get("repo_name")}',
                     'known_via': 'repository', 'mapping_name': m.get('name')}
-    if not repo_name:
+
+    # Definition-name prefix — last resort, ONLY when the build carries no
+    # repository info AND only for mappings without an allowlist.
+    if not repo_name and not repo_id:
         for m in mappings:
+            if m.get('pipeline_definition_ids'):
+                continue
             m_repo = str(m.get('repo_name') or '').strip()
             if m_repo and definition.lower().startswith(m_repo.lower()):
                 return {'classification': 'known',
@@ -155,6 +190,45 @@ async def _azure_cfg(db: AsyncSession, organization_id: int) -> dict[str, str] |
     if not config or not config.secret or not config.base_url:
         return None
     return {'org_url': config.base_url.rstrip('/'), 'pat': config.secret}
+
+
+async def list_pipelines_for_mapping(
+    db: AsyncSession,
+    *,
+    organization_id: int,
+    user_id: int,
+    mapping_name: str,
+    project: str = '',
+    repo_name: str = '',
+) -> dict[str, Any]:
+    """Combobox source for the mapping editor: pipelines BOUND to the repo
+    (authoritative) + all project pipelines (so a centralized-YAML pipeline
+    the repo filter misses can still be selected manually)."""
+    cfg = await _azure_cfg(db, organization_id)
+    if cfg is None:
+        return {'repo_bound': [], 'all': [], 'error': 'Azure integration not configured'}
+
+    # Prefer explicit project/repo (from the live form); else resolve from the
+    # saved mapping by name.
+    proj = project.strip()
+    repo = repo_name.strip()
+    if not proj or not repo:
+        entry = find_mapping_by_name(await load_prefs_mappings(db, user_id), mapping_name)
+        norm = normalize_mapping(entry) if entry else None
+        if norm:
+            proj = proj or norm['project']
+            repo = repo or norm['repo_name']
+    if not proj or not repo:
+        return {'repo_bound': [], 'all': [], 'error': 'mapping project/repo could not be resolved'}
+
+    client = AzureDevOpsClient()
+    repo_id = await client.get_repository_id(cfg=cfg, project=proj, repo=repo)
+    repo_bound, all_defs = await asyncio.gather(
+        client.list_repo_pipeline_definitions(cfg=cfg, project=proj, repository_id=repo_id) if repo_id else asyncio.sleep(0, result=[]),
+        client.list_all_pipeline_definitions(cfg=cfg, project=proj),
+        return_exceptions=False,
+    )
+    return {'repo_bound': repo_bound, 'all': all_defs, 'repo_id': repo_id or '', 'error': None}
 
 
 def _resolve_work_item_id(task: TaskRecord) -> str | None:
@@ -267,6 +341,17 @@ async def _build_board_inner(
         await _load_user(uid)
     mappings = list(known_mappings.values())[:10]
 
+    # Resolve each mapping's repo GUID once — the deterministic key for
+    # build / approval classification (vs fragile name matching).
+    _client0 = AzureDevOpsClient()
+
+    async def _resolve_repo_id(m: dict[str, Any]) -> None:
+        rid = await _client0.get_repository_id(cfg=cfg, project=m['project'], repo=m['repo_name'])
+        if rid:
+            m['repo_id'] = rid
+
+    await asyncio.gather(*(_resolve_repo_id(m) for m in mappings), return_exceptions=True)
+
     # ── Latest review per task (single IN query).
     reviews_by_task: dict[int, dict[str, Any]] = {}
     task_ids = [t.id for t, _ in journable]
@@ -323,9 +408,13 @@ async def _build_board_inner(
             errors.append({'section': 'builds', 'error': str(item)[:200]})
             continue
         name, builds = item
-        builds_by_mapping[name] = builds
         mapping = known_mappings.get(name) or {}
-        pipelines.append({'mapping_name': name, 'project': mapping.get('project', ''), 'builds': builds})
+        # Filter the project-wide build list down to THIS mapping's repo
+        # (allowlist → repo GUID → name), so the panel shows only the repo's
+        # own pipelines (e.g. NoPaper-Api/Web) — not ERP/RFID/IntegrationUI.
+        own_builds = [b for b in builds if classify_build(b, [mapping])['classification'] == 'known']
+        builds_by_mapping[name] = own_builds
+        pipelines.append({'mapping_name': name, 'project': mapping.get('project', ''), 'builds': own_builds})
 
     raw_approvals: list[tuple[str, dict[str, Any]]] = []
     for item in approval_results:
@@ -459,6 +548,12 @@ async def act_on_approval(
         raise ApprovalGuardError('No repo mappings configured — nothing is approvable from the board')
 
     client = AzureDevOpsClient()
+    # Resolve repo GUIDs so classification matches the board (deterministic).
+    async def _rid(m: dict[str, Any]) -> None:
+        rid = await client.get_repository_id(cfg=cfg, project=m['project'], repo=m['repo_name'])
+        if rid:
+            m['repo_id'] = rid
+    await asyncio.gather(*(_rid(m) for m in mappings), return_exceptions=True)
     pending = await client.list_pending_approvals(cfg=cfg, project=project)
     approval = next((a for a in pending if str(a.get('id')) == str(approval_id)), None)
     if approval is None:

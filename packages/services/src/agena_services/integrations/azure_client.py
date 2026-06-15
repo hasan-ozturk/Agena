@@ -1589,6 +1589,7 @@ class AzureDevOpsClient:
     def _map_build(self, build: dict[str, Any]) -> dict[str, Any]:
         return {
             'id': int(build.get('id') or 0),
+            'definition_id': int(((build.get('definition') or {}).get('id')) or 0),
             'definition_name': str(((build.get('definition') or {}).get('name')) or ''),
             'source_branch': str(build.get('sourceBranch') or '').replace('refs/heads/', ''),
             'source_version': str(build.get('sourceVersion') or ''),
@@ -1597,9 +1598,86 @@ class AzureDevOpsClient:
             'queue_time': str(build.get('queueTime') or ''),
             'finish_time': str(build.get('finishTime') or ''),
             'web_url': str(((build.get('_links') or {}).get('web') or {}).get('href') or ''),
+            'repository_id': str(((build.get('repository') or {}).get('id')) or ''),
             'repository_name': str(((build.get('repository') or {}).get('name')) or ''),
             'project_name': str(((build.get('project') or {}).get('name')) or ''),
         }
+
+    async def get_repository_id(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+        repo: str,
+    ) -> str | None:
+        """Resolve an Azure git repo's GUID — the deterministic key for
+        matching builds/pipelines to a mapping (beats fragile name matching)."""
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project or not repo:
+            return None
+        from urllib.parse import quote
+        url = f'{org_url}/{quote(project)}/_apis/git/repositories/{quote(repo)}?api-version=7.1'
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                return None
+            return str((resp.json() or {}).get('id') or '') or None
+        except Exception:
+            return None
+
+    async def list_repo_pipeline_definitions(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+        repository_id: str,
+    ) -> list[dict[str, Any]]:
+        """Build definitions BOUND to a repo (their YAML lives there), via
+        repositoryId filter — the authoritative per-repo pipeline set."""
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project or not repository_id:
+            return []
+        from urllib.parse import quote
+        url = (
+            f'{org_url}/{quote(project)}/_apis/build/definitions'
+            f'?repositoryId={repository_id}&repositoryType=TfsGit&api-version=7.1'
+        )
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                return []
+            rows = (resp.json() or {}).get('value', []) or []
+        except Exception:
+            return []
+        return [{'id': int(d.get('id') or 0), 'name': str(d.get('name') or '')} for d in rows if d.get('id')]
+
+    async def list_all_pipeline_definitions(
+        self,
+        *,
+        cfg: dict[str, str],
+        project: str,
+    ) -> list[dict[str, Any]]:
+        """All build definitions in a project — lets the user pick a
+        centralized-YAML pipeline the repositoryId filter wouldn't surface."""
+        org_url, pat = self._devops_creds(cfg)
+        if not org_url or not pat or not project:
+            return []
+        from urllib.parse import quote
+        url = f'{org_url}/{quote(project)}/_apis/build/definitions?api-version=7.1&$top=500'
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers(pat))
+            if resp.status_code != 200:
+                return []
+            rows = (resp.json() or {}).get('value', []) or []
+        except Exception:
+            return []
+        return sorted(
+            [{'id': int(d.get('id') or 0), 'name': str(d.get('name') or '')} for d in rows if d.get('id')],
+            key=lambda d: d['name'].lower(),
+        )
 
     async def list_builds(
         self,

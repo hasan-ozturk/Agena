@@ -297,6 +297,10 @@ export type RepoMapping = {
   github_repo_full_name?: string;
   analyze_prompt?: string;
   default_branch?: string;
+  // Explicit Azure pipeline allowlist for the DevOps Board: which pipelines
+  // belong to this repo's delivery flow (powers the board's pipeline panel +
+  // approval classification). Empty → board auto-discovers by repo GUID.
+  pipeline_definitions?: { id: number; name: string }[];
 };
 
 export interface UserPrefs {

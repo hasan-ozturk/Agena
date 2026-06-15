@@ -92,6 +92,11 @@ export default function RepoMappingsPage() {
   const [branches, setBranches] = useState<Array<{ name: string; is_default: boolean }>>([]);
   const [selectedBranch, setSelectedBranch] = useState('');
   const [loadingBranches, setLoadingBranches] = useState(false);
+  // Azure pipeline allowlist for this mapping (DevOps Board).
+  type PipelineDef = { id: number; name: string };
+  const [pipelineOptions, setPipelineOptions] = useState<{ repo_bound: PipelineDef[]; all: PipelineDef[] }>({ repo_bound: [], all: [] });
+  const [selectedPipelines, setSelectedPipelines] = useState<PipelineDef[]>([]);
+  const [loadingPipelines, setLoadingPipelines] = useState(false);
   const githubFetchRef = useRef(0);
 
   useEffect(() => {
@@ -369,6 +374,7 @@ export default function RepoMappingsPage() {
     setEditingId(null);
     setBranches([]);
     setSelectedBranch('');
+    setSelectedPipelines([]);
   }
 
   function startEdit(item: RepoMapping) {
@@ -415,6 +421,7 @@ export default function RepoMappingsPage() {
     setRepoPlaybook(item.repo_playbook || '');
     setAnalyzePrompt(item.analyze_prompt || '');
     setSelectedBranch(item.default_branch || '');
+    setSelectedPipelines(item.pipeline_definitions || []);
   }
 
   useEffect(() => {
@@ -468,6 +475,29 @@ export default function RepoMappingsPage() {
       }).catch(() => {}).finally(() => setLoadingBranches(false));
     }
   }, [sourceProvider, selRepoUrl, selProject, selGithubRepo]);
+
+  // Load Azure pipeline options when a project + repo is selected, so the
+  // user can pick exactly which pipelines belong to this repo (DevOps Board
+  // allowlist). Repo-bound pipelines are auto-discovered; the user may also
+  // add a centralized-YAML pipeline from the full project list.
+  useEffect(() => {
+    if (sourceProvider !== 'azure') { setPipelineOptions({ repo_bound: [], all: [] }); return; }
+    const repoName = repos.find((r) => r.remote_url === selRepoUrl)?.name || pendingRepoName || '';
+    if (!selProject || !repoName) { setPipelineOptions({ repo_bound: [], all: [] }); return; }
+    let cancelled = false;
+    setLoadingPipelines(true);
+    apiFetch<{ repo_bound: PipelineDef[]; all: PipelineDef[] }>(
+      `/devops/repo-pipelines?project=${encodeURIComponent(selProject)}&repo_name=${encodeURIComponent(repoName)}`
+    ).then((res) => {
+      if (cancelled) return;
+      setPipelineOptions({ repo_bound: res.repo_bound || [], all: res.all || [] });
+      // First time (no explicit selection yet on a new mapping): preselect
+      // the repo-bound pipelines so it works out of the box.
+      setSelectedPipelines((cur) => (cur.length === 0 && !editingId ? (res.repo_bound || []) : cur));
+    }).catch(() => { if (!cancelled) setPipelineOptions({ repo_bound: [], all: [] }); })
+      .finally(() => { if (!cancelled) setLoadingPipelines(false); });
+    return () => { cancelled = true; };
+  }, [sourceProvider, selProject, selRepoUrl, pendingRepoName, repos, editingId]);
 
   // Ask the host bridge for likely local-path matches whenever the
   // user picks a different repo. Bridge scans common dev folders (one
@@ -564,6 +594,7 @@ export default function RepoMappingsPage() {
         azure_repo_url: effectiveRepoUrl,
         azure_repo_name: effectiveRepoName,
         default_branch: selectedBranch || undefined,
+        pipeline_definitions: selectedPipelines.length ? selectedPipelines : undefined,
       };
     } else {
       const selectedRepo = githubRepos.find((r) => r.full_name === selGithubRepo);
@@ -800,6 +831,73 @@ export default function RepoMappingsPage() {
               )}
             </div>
           </div>
+          {/* Azure pipeline allowlist — DevOps Board uses this to show this
+              repo's pipelines and to gate which deploy approvals are
+              approvable. Auto-discovered (repo-bound) options are checked by
+              default; add others (e.g. centralized-YAML) from the list. */}
+          {sourceProvider === 'azure' && (selProject && (selRepoUrl || pendingRepoName)) && (
+            <div>
+              <div style={fieldLabelStyle}>{t('mappings.pipelines')}</div>
+              {loadingPipelines ? (
+                <div style={{ ...fieldStyle, display: 'flex', alignItems: 'center', color: 'var(--ink-35)', fontSize: 12 }}>{t('mappings.loading')}</div>
+              ) : (() => {
+                const boundIds = new Set(pipelineOptions.repo_bound.map((p) => p.id));
+                const selectedIds = new Set(selectedPipelines.map((p) => p.id));
+                // Add-dropdown options = repo-bound + all, minus already-selected.
+                const boundAvail = pipelineOptions.repo_bound.filter((p) => !selectedIds.has(p.id));
+                const otherAvail = pipelineOptions.all.filter((p) => !selectedIds.has(p.id) && !boundIds.has(p.id));
+                return (
+                  <>
+                    {/* Selected pipelines as removable chips */}
+                    {selectedPipelines.length > 0 ? (
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                        {selectedPipelines.map((p) => (
+                          <span key={p.id} style={{
+                            padding: '4px 8px 4px 11px', borderRadius: 999, fontSize: 12, fontWeight: 600,
+                            border: '1px solid var(--acc)', background: 'var(--acc-soft)', color: 'var(--acc)',
+                            display: 'inline-flex', alignItems: 'center', gap: 6,
+                          }}>
+                            {p.name}
+                            {boundIds.has(p.id) && <span style={{ fontSize: 9, opacity: 0.7 }}>({t('mappings.pipelineAuto')})</span>}
+                            <button type='button' onClick={() => setSelectedPipelines((cur) => cur.filter((s) => s.id !== p.id))}
+                              style={{ background: 'none', border: 'none', color: 'var(--acc)', cursor: 'pointer', fontSize: 14, padding: 0, lineHeight: 1, display: 'inline-flex' }}>×</button>
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 11, color: 'var(--ink-35)', marginBottom: 8 }}>{t('mappings.noPipelinesSelected')}</div>
+                    )}
+                    {/* Add via native combobox dropdown (grouped) */}
+                    {(boundAvail.length > 0 || otherAvail.length > 0) && (
+                      <select
+                        value=''
+                        onChange={(e) => {
+                          const id = Number(e.target.value);
+                          if (!id) return;
+                          const found = [...pipelineOptions.repo_bound, ...pipelineOptions.all].find((p) => p.id === id);
+                          if (found) setSelectedPipelines((cur) => cur.some((s) => s.id === id) ? cur : [...cur, { id: found.id, name: found.name }]);
+                        }}
+                        style={{ ...fieldStyle, cursor: 'pointer' }}
+                      >
+                        <option value=''>{t('mappings.addPipeline')}</option>
+                        {boundAvail.length > 0 && (
+                          <optgroup label={t('mappings.pipelineGroupRepo')}>
+                            {boundAvail.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                          </optgroup>
+                        )}
+                        {otherAvail.length > 0 && (
+                          <optgroup label={t('mappings.pipelineGroupOther')}>
+                            {otherAvail.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                          </optgroup>
+                        )}
+                      </select>
+                    )}
+                  </>
+                );
+              })()}
+              <div style={{ fontSize: 10, color: 'var(--ink-35)', marginTop: 6 }}>{t('mappings.pipelinesHint')}</div>
+            </div>
+          )}
           <div>
             <div style={fieldLabelStyle}>{t('mappings.notes')}</div>
             <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('mappings.notesPlaceholder')} style={fieldStyle} />
@@ -907,6 +1005,18 @@ export default function RepoMappingsPage() {
                   {m.notes && <span><b style={{ color: 'var(--ink-78)' }}>{t('mappings.col.notes')}:</b> {m.notes}</span>}
                   {m.repo_playbook && <span title={m.repo_playbook}><b style={{ color: 'var(--ink-78)' }}>{t('mappings.playbookLabel')}:</b> {m.repo_playbook.length > 60 ? m.repo_playbook.slice(0, 60) + '…' : m.repo_playbook}</span>}
                 </div>
+
+                {/* Selected pipelines (DevOps Board allowlist) */}
+                {(m.pipeline_definitions && m.pipeline_definitions.length > 0) && (
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', fontSize: 11 }}>
+                    <b style={{ color: 'var(--ink-78)' }}>{t('mappings.pipelines')}:</b>
+                    {m.pipeline_definitions.map((p) => (
+                      <span key={p.id} style={{ padding: '2px 8px', borderRadius: 999, fontSize: 10, fontWeight: 700, background: 'var(--acc-soft)', color: 'var(--acc)', border: '1px solid var(--panel-border)' }}>
+                        {p.name}
+                      </span>
+                    ))}
+                  </div>
+                )}
 
                 {/* Profile + agents.md row */}
                 <div style={{ display: 'grid', gap: 4 }}>

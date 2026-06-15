@@ -20,6 +20,7 @@ from agena_services.services.devops_board_service import (
     ApprovalMismatchError,
     act_on_approval,
     build_board,
+    list_pipelines_for_mapping,
 )
 
 router = APIRouter(prefix='/devops', tags=['devops'])
@@ -50,6 +51,25 @@ async def get_board(
         organization_id=tenant.organization_id,
         user_id=tenant.user_id,
         days=days,
+    )
+
+
+@router.get('/repo-pipelines')
+async def get_repo_pipelines(
+    mapping_name: str = Query(default=''),
+    project: str = Query(default=''),
+    repo_name: str = Query(default=''),
+    tenant: CurrentTenant = Depends(require_permission('tasks:read')),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Pipeline options for the mapping editor combobox (repo-bound + all)."""
+    return await list_pipelines_for_mapping(
+        db,
+        organization_id=tenant.organization_id,
+        user_id=tenant.user_id,
+        mapping_name=mapping_name,
+        project=project,
+        repo_name=repo_name,
     )
 
 
