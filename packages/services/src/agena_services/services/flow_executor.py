@@ -2467,8 +2467,9 @@ async def run_flow(
             await db.refresh(flow_run)
             return flow_run
 
-        if gate_approved:
-            # Reuse the approved gate row as this node's execution step.
+        if gate_approved and prior is not None:
+            # Resume after a human approval: reuse the persisted approved gate
+            # row as this node's execution step.
             step = prior
             step.status = 'running'
             step.input_json = json.dumps({'node': node, 'context_keys': list(context.keys())})
@@ -2476,6 +2477,10 @@ async def run_flow(
             step.finished_at = None
             await db.flush()
         else:
+            # Either a normal (ungated) node, OR a gate that auto-approved on a
+            # FRESH run (review clean) — there is no prior gate row to reuse, so
+            # create a new step. (gate_approved with prior=None hit this path and
+            # crashed on `prior.status` before this guard.)
             step = FlowRunStep(
                 run_id=flow_run_id,
                 node_id=node_id,
