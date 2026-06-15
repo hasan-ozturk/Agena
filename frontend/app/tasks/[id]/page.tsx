@@ -697,6 +697,16 @@ export default function TaskDetailPage() {
     );
   }, [rightTab, taskId]);
 
+  // Deep-link: ?tab=pipeline (e.g. from the DevOps Board journey row) opens
+  // the matching tab on mount.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const tab = new URLSearchParams(window.location.search).get('tab');
+    const valid = ['activity', 'agent', 'steps', 'pipeline', 'reviews', 'memory', 'diff', 'logs'];
+    if (tab && valid.includes(tab)) setRightTab(tab as typeof rightTab);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Pipeline tab: load the unified delivery run; poll while non-terminal.
   useEffect(() => {
     if (rightTab !== 'pipeline' || !taskId) return;

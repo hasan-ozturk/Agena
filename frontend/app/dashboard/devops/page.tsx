@@ -212,7 +212,7 @@ export default function DevOpsBoardPage() {
                       WI #{j.work_item.id}{j.work_item.state ? ` · ${j.work_item.state}` : ''} {j.work_item.url ? '↗' : ''}
                     </Chip>
                     <Arrow />
-                    <Chip color={taskColor} href={`/dashboard/tasks/${j.task_id}`} title={j.task_title}>
+                    <Chip color={taskColor} href={`/dashboard/tasks/${j.task_id}?tab=pipeline`} title={j.task_title}>
                       {tt('devops.chipTask')} #{j.task_id} · {j.task_status}
                     </Chip>
                     <Arrow />

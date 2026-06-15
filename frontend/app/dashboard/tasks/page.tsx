@@ -1877,36 +1877,31 @@ export default function DashboardTasksPage() {
                 background: 'var(--glass)', color: 'var(--ink-50)',
                 textTransform: 'capitalize', width: 'fit-content',
               }}>{sourceLabel(task.source, t)}</span>
-              {(() => { const _eff = effectiveStatus(task); const _ans = task.answer_summary || t('tasks.status.answeredTooltip' as TranslationKey); return (
-              <span
-                title={_eff === 'answered' ? _ans : undefined}
-                onClick={_eff === 'answered' ? (e) => { e.stopPropagation(); e.preventDefault(); setAnswerNotice({ title: task.title, text: _ans }); } : undefined}
-                style={{
-                display: 'inline-flex', alignItems: 'center', gap: 6,
-                padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 700,
-                background: `${statusColor(_eff)}18`,
-                border: `1px solid ${statusColor(_eff)}40`,
-                color: statusColor(_eff), width: 'fit-content', textTransform: 'capitalize',
-                cursor: _eff === 'answered' ? 'pointer' : 'default',
-              }}>
-                <span style={{ width: 5, height: 5, borderRadius: '50%', background: statusColor(_eff), animation: task.status === 'running' ? 'pulse-brand 1.5s infinite' : 'none' }} />
-                {statusLabel(_eff, t)}
-              </span>
-              ); })()}
-              {task.delivery_stage && task.delivery_stage_label_key && STAGE_PIPELINE.has(task.delivery_stage) && (
-                <span
-                  style={{
-                    display: 'inline-flex', alignItems: 'center', gap: 6,
-                    padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 700,
-                    background: `${stageColor(task.delivery_stage)}14`,
-                    border: `1px solid ${stageColor(task.delivery_stage)}40`,
-                    color: stageColor(task.delivery_stage), width: 'fit-content',
-                  }}
-                >
-                  <NavIcon name="activity" size={11} />
-                  {t(task.delivery_stage_label_key as TranslationKey)}
-                </span>
-              )}
+              {(() => {
+                const _eff = effectiveStatus(task);
+                const _ans = task.answer_summary || t('tasks.status.answeredTooltip' as TranslationKey);
+                // Single STATUS cell (one grid child): show the richer delivery
+                // stage when it's pipeline-meaningful, otherwise the raw status.
+                const useStage = !!(task.delivery_stage && task.delivery_stage_label_key && STAGE_PIPELINE.has(task.delivery_stage));
+                const col = useStage ? stageColor(task.delivery_stage) : statusColor(_eff);
+                const label = useStage ? t(task.delivery_stage_label_key as TranslationKey) : statusLabel(_eff, t);
+                const answered = !useStage && _eff === 'answered';
+                return (
+                  <span
+                    title={answered ? _ans : (useStage ? statusLabel(_eff, t) : undefined)}
+                    onClick={answered ? (e) => { e.stopPropagation(); e.preventDefault(); setAnswerNotice({ title: task.title, text: _ans }); } : undefined}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                      padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 700,
+                      background: `${col}18`, border: `1px solid ${col}40`, color: col,
+                      width: 'fit-content', textTransform: useStage ? 'none' : 'capitalize',
+                      cursor: answered ? 'pointer' : 'default',
+                    }}>
+                    <span style={{ width: 5, height: 5, borderRadius: '50%', background: col, animation: task.status === 'running' ? 'pulse-brand 1.5s infinite' : 'none' }} />
+                    {label}
+                  </span>
+                );
+              })()}
               <div>
                 <span style={{ fontSize: 12, color: 'var(--ink-65)', fontWeight: 600 }}>{fmtDuration(task.run_duration_sec ?? task.duration_sec)}</span>
               </div>
