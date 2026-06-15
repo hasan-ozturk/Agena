@@ -67,6 +67,79 @@ async def _fail_stale_running_tasks() -> None:
         logger.warning('Marked %s stale running task(s) as failed', len(stale_tasks))
 
 
+# Durable flow recovery: a live run touches FlowRun.updated_at on every step,
+# so a run stale past this window had its executor (worker/API) die. The window
+# must exceed the longest single step (a developer node can take minutes).
+FLOW_STALE_MINUTES = 15
+FLOW_RESUME_CAP = 3
+
+
+async def _recover_stale_flow_runs() -> None:
+    """Auto-resume flow runs orphaned by a worker/API crash (cap'li).
+
+    Atomic CLAIM via conditional UPDATE (single-winner across workers/pollers):
+    only the row still stale at update time is taken. Within the cap → bump
+    resume_attempts, refresh updated_at, re-enqueue (worker continues from the
+    last committed step via run_flow's resume). Past the cap → mark failed.
+    run_flow's terminal-status guard makes a duplicate pick a no-op if the
+    original executor actually finished."""
+    from sqlalchemy import update as _sa_update
+    from agena_models.models.flow_run import FlowRun
+    from agena_services.services.queue_service import QueueService
+
+    stale_before = datetime.utcnow() - timedelta(minutes=FLOW_STALE_MINUTES)
+    active = ('running', 'resuming', 'queued')
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(FlowRun).where(
+                FlowRun.status.in_(active),
+                FlowRun.updated_at < stale_before,
+            )
+        )).scalars().all())
+        if not rows:
+            return
+        qs = QueueService()
+        for fr in rows:
+            tid = (fr.task_id or '').strip()
+            # Requeueable only if task_id is an EXISTING internal TaskRecord in
+            # this org. Legacy synchronous-era orphans store the EXTERNAL work
+            # item id here (no such internal record) → fail them, don't churn.
+            requeueable = False
+            if tid.isdigit() and fr.organization_id is not None:
+                tr = await session.get(TaskRecord, int(tid))
+                requeueable = tr is not None and tr.organization_id == fr.organization_id
+            if (fr.resume_attempts or 0) >= FLOW_RESUME_CAP or not requeueable:
+                res = await session.execute(
+                    _sa_update(FlowRun).where(
+                        FlowRun.id == fr.id,
+                        FlowRun.status.in_(active),
+                        FlowRun.updated_at < stale_before,
+                    ).values(status='failed', finished_at=datetime.utcnow(), updated_at=datetime.utcnow())
+                )
+                if res.rowcount or 0:
+                    logger.warning('Flow run %s marked failed (attempts=%s, requeueable=%s)',
+                                   fr.id, fr.resume_attempts, requeueable)
+                continue
+            res = await session.execute(
+                _sa_update(FlowRun).where(
+                    FlowRun.id == fr.id,
+                    FlowRun.status.in_(active),
+                    FlowRun.updated_at < stale_before,
+                ).values(status='resuming', resume_attempts=(fr.resume_attempts or 0) + 1, updated_at=datetime.utcnow())
+            )
+            if not (res.rowcount or 0):
+                continue  # another poller/worker claimed it first
+            await qs.enqueue({
+                'organization_id': fr.organization_id,
+                'task_id': int(tid),
+                'mode': 'flow_run',
+                'flow_run_id': fr.id,
+                'create_pr': True,
+            })
+            logger.warning('Re-queued stale flow run %s (attempt %s)', fr.id, (fr.resume_attempts or 0) + 1)
+        await session.commit()
+
+
 async def _poll_metric_snapshots() -> None:
     """Sentinel: snapshot New Relic metrics (throughput, latency, error-rate,
     DB time, apdex) for every org with active APM mappings into metric_snapshots."""
@@ -487,16 +560,31 @@ async def _run_single_task(payload: dict) -> None:
         if run_mode == 'flow_run':
             import json as _json
             from agena_services.services.flow_executor import run_flow
+            from agena_models.models.flow_run import FlowRun
+            # flow_run_id present → FlowRun was pre-created ('queued') or paused
+            # ('resuming'); we resume it durably. Absent → legacy fresh run.
+            flow_run_id = payload.get('flow_run_id')
+            flow = None
+            flow_user_id = task.created_by_user_id
             flow_data = await queue_service.client.get(f'flow_def:{task_id}')
-            if not flow_data:
+            if flow_data:
+                flow_info = _json.loads(flow_data)
+                flow = flow_info.get('flow')
+                flow_user_id = flow_info.get('user_id', flow_user_id)
+            if flow is None and flow_run_id:
+                # Durable fallback: Redis def expired (>24h) — read the per-run
+                # snapshot persisted on the FlowRun row.
+                fr = await session.get(FlowRun, int(flow_run_id))
+                if fr is not None and fr.flow_snapshot_json:
+                    snap = _json.loads(fr.flow_snapshot_json)
+                    flow = snap.get('flow')
+                    flow_user_id = snap.get('user_id', flow_user_id)
+            if not flow:
                 task.status = 'failed'
-                task.failure_reason = 'Flow definition not found in Redis (expired or missing)'
+                task.failure_reason = 'Flow definition not found (Redis expired and no run snapshot)'
                 await session.commit()
                 await task_service.add_log(task.id, organization_id, 'failed', task.failure_reason)
                 return
-            flow_info = _json.loads(flow_data)
-            flow = flow_info['flow']
-            flow_user_id = flow_info.get('user_id', task.created_by_user_id)
             flow_run_row = await run_flow(
                 flow=flow,
                 task={
@@ -510,6 +598,7 @@ async def _run_single_task(payload: dict) -> None:
                 user_id=flow_user_id,
                 organization_id=organization_id,
                 db=session,
+                resume_run_id=int(flow_run_id) if flow_run_id else None,
             )
             # Keep the flow def around while the run is paused at an
             # approval gate (resume reads its DB snapshot, but a same-task
@@ -638,6 +727,7 @@ async def process_queue() -> None:
         if now - last_health_check >= 30:
             await _fail_stale_running_tasks()
             await _cleanup_stale_repo_locks()
+            await _recover_stale_flow_runs()
             last_health_check = now
 
         if now - last_nr_poll >= 300:  # 5 minutes

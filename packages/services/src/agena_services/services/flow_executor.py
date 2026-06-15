@@ -2268,6 +2268,16 @@ async def run_flow(
         if flow_run.status in ('completed', 'failed', 'cancelled', 'rejected'):
             raise ValueError(f'FlowRun {resume_run_id} is already terminal ({flow_run.status})')
         flow_run.status = 'running'
+        # Durable-recovery hygiene: backfill org/snapshot if missing (legacy or
+        # pre-created queued runs), and refresh the activity timestamp.
+        if flow_run.organization_id is None:
+            flow_run.organization_id = organization_id
+        if not flow_run.flow_snapshot_json:
+            flow_run.flow_snapshot_json = json.dumps(
+                {'flow': flow, 'task': task, 'user_id': user_id, 'organization_id': organization_id},
+                ensure_ascii=False, default=str,
+            )
+        flow_run.updated_at = now
         rows = (await db.execute(
             select(FlowRunStep).where(FlowRunStep.run_id == flow_run.id).order_by(FlowRunStep.id)
         )).scalars().all()
@@ -2275,14 +2285,22 @@ async def run_flow(
             prior_steps[row.node_id] = row  # latest row per node wins
         await db.flush()
     else:
-        # FlowRun oluştur
+        # FlowRun oluştur — org + durable snapshot + updated_at, böylece worker
+        # recovery poller'ı bu run'ı standalone resume edebilir (Redis TTL/gate
+        # step'e bağımlı değil).
         flow_run = FlowRun(
             flow_id=flow['id'],
             flow_name=flow['name'],
             task_id=str(task.get('id', '')),
             task_title=task.get('title', ''),
             user_id=user_id,
+            organization_id=organization_id,
             status='running',
+            flow_snapshot_json=json.dumps(
+                {'flow': flow, 'task': task, 'user_id': user_id, 'organization_id': organization_id},
+                ensure_ascii=False, default=str,
+            ),
+            updated_at=now,
             started_at=now,
         )
         db.add(flow_run)
@@ -2571,6 +2589,7 @@ async def run_flow(
         # class of bug). The resume path already reads committed steps, so this
         # is fully compatible.
         step.finished_at = datetime.now(timezone.utc)
+        flow_run.updated_at = datetime.now(timezone.utc)  # staleness signal for recovery poller
         await db.commit()
 
     # Boss mode: mark flow complete
@@ -2580,6 +2599,7 @@ async def run_flow(
 
     flow_run.status = overall_status
     flow_run.finished_at = datetime.now(timezone.utc)
+    flow_run.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(flow_run)
     return flow_run

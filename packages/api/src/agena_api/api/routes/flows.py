@@ -168,17 +168,68 @@ async def run_flow_endpoint(
     if not flow:
         raise HTTPException(status_code=404, detail=f'Flow {body.flow_id} bulunamadı')
 
-    flow_run = await run_flow(
-        flow=flow,
+    # DURABLE ASYNC: don't run the flow inline (it blocks the request for
+    # minutes and orphans the run on restart). Resolve/create the internal
+    # TaskRecord, pre-create the FlowRun ('queued') with a durable snapshot,
+    # enqueue it, and return immediately. The worker runs it via run_flow.
+    from agena_services.services.flow_executor import _resolve_or_create_task_id
+    from agena_services.services.queue_service import QueueService
+
+    internal_task_id = await _resolve_or_create_task_id(
         task=body.task,
+        context={'user_id': tenant.user_id},
+        db=db,
+        organization_id=tenant.organization_id,
+        create_if_missing=True,
+    )
+    if internal_task_id is None:
+        raise HTTPException(status_code=400, detail='Flow için task çözümlenemedi')
+
+    # Snapshot task carries the internal id so run_flow resolves the same record.
+    snapshot_task = {**body.task, 'id': internal_task_id}
+    now = datetime.now(timezone.utc)
+    flow_run = FlowRun(
+        flow_id=flow['id'],
+        flow_name=flow['name'],
+        task_id=str(internal_task_id),
+        task_title=body.task.get('title', ''),
         user_id=tenant.user_id,
         organization_id=tenant.organization_id,
-        db=db,
+        status='queued',
+        flow_snapshot_json=json.dumps(
+            {'flow': flow, 'task': snapshot_task, 'user_id': tenant.user_id, 'organization_id': tenant.organization_id},
+            ensure_ascii=False, default=str,
+        ),
+        updated_at=now,
+        started_at=now,
     )
-    # Reload with eager-loaded steps to avoid async lazy-load during response serialization.
+    db.add(flow_run)
+    await db.flush()
+    flow_run_id = int(flow_run.id)
+
+    qs = QueueService()
+    # Flow def for the worker (keyed by internal task id) — snapshot on the row
+    # is the durable fallback if this 24h key expires.
+    await qs.client.set(
+        f'flow_def:{internal_task_id}',
+        json.dumps(
+            {'flow': flow, 'user_id': tenant.user_id, 'organization_id': tenant.organization_id},
+            ensure_ascii=False, default=str,
+        ),
+        ex=86400,
+    )
+    await qs.enqueue({
+        'organization_id': tenant.organization_id,
+        'task_id': internal_task_id,
+        'mode': 'flow_run',
+        'flow_run_id': flow_run_id,
+        'create_pr': True,
+    })
+    await db.commit()
+
     run_result = await db.execute(
         select(FlowRun)
-        .where(FlowRun.id == flow_run.id, FlowRun.user_id == tenant.user_id)
+        .where(FlowRun.id == flow_run_id, FlowRun.user_id == tenant.user_id)
         .options(selectinload(FlowRun.steps))
     )
     run_row = run_result.scalar_one_or_none()
@@ -315,7 +366,30 @@ async def approve_run(
         gate.finished_at = datetime.now(timezone.utc)
     await db.commit()
 
-    asyncio.create_task(_resume_flow_run_bg(run_id, tenant.organization_id, snapshot_raw))
+    # DURABLE RESUME: route through the worker when the run has a valid internal
+    # task anchor (survives API restart). Legacy runs whose task_id isn't an
+    # internal record fall back to the in-process background resume.
+    internal_tid: int | None = None
+    run_for_resume = (await db.execute(
+        select(FlowRun).where(FlowRun.id == run_id)
+    )).scalar_one_or_none()
+    if run_for_resume and (run_for_resume.task_id or '').strip().isdigit():
+        from agena_models.models.task_record import TaskRecord
+        tr = await db.get(TaskRecord, int(run_for_resume.task_id))
+        if tr is not None and tr.organization_id == tenant.organization_id:
+            internal_tid = int(run_for_resume.task_id)
+
+    if internal_tid is not None:
+        from agena_services.services.queue_service import QueueService
+        await QueueService().enqueue({
+            'organization_id': tenant.organization_id,
+            'task_id': internal_tid,
+            'mode': 'flow_run',
+            'flow_run_id': run_id,
+            'create_pr': True,
+        })
+    else:
+        asyncio.create_task(_resume_flow_run_bg(run_id, tenant.organization_id, snapshot_raw))
 
     run_row = (await db.execute(
         select(FlowRun)

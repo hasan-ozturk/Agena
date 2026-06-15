@@ -2206,7 +2206,7 @@ const pInp: React.CSSProperties = { width: '100%', padding: '9px 12px', borderRa
 // ── RunHistoryPanel ───────────────────────────────────────────────────────────
 const STATUS_COLOR: Record<string, string> = {
   completed: '#3f9d6a', failed: '#cf5b57', running: '#5b9bd5',
-  pending: '#c98a2b', cancelled: '#94a3b8',
+  pending: '#c98a2b', queued: '#c98a2b', cancelled: '#94a3b8',
   pending_approval: '#c98a2b', awaiting_approval: '#c98a2b',
   approved: '#3f9d6a', rejected: '#94a3b8', resuming: '#5b9bd5',
 };
