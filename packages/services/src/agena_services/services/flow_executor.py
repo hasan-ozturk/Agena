@@ -2169,6 +2169,81 @@ def _restore_step_into_context(
             skip_nodes.add(true_target)
 
 
+_SEVERITY_RANK = {'clean': 0, 'none': 0, '': 0, 'low': 1, 'medium': 2, 'moderate': 2, 'high': 3, 'critical': 4}
+
+
+async def _evaluate_review_gate(
+    db: AsyncSession,
+    node: dict[str, Any],
+    context: dict[str, Any],
+    organization_id: int,
+) -> tuple[bool, str]:
+    """Decide whether a gate can auto-approve based on the AI review.
+
+    Reads the latest TaskReview for the PR's task (the developer pipeline
+    node creates it + auto-review fires on PR open). Auto-approves only when
+    a COMPLETED review meets score/severity bounds. Waits briefly because the
+    auto-review runs async right after the PR is opened. On any uncertainty
+    (no review, still running, error) returns False → human gate (safe)."""
+    import asyncio as _asyncio
+    from agena_core.database import SessionLocal
+    from agena_models.models.task_review import TaskReview
+
+    min_score = int(node.get('min_score', 80) or 80)
+    max_sev = str(node.get('max_severity', 'low') or 'low').strip().lower()
+    max_rank = _SEVERITY_RANK.get(max_sev, 1)
+    wait_sec = int(node.get('review_wait_sec', 120) or 120)
+
+    # Resolve the PR's task id from a prior pipeline node output.
+    task_id: int | None = None
+    for out in (context.get('outputs') or {}).values():
+        if isinstance(out, dict) and out.get('task_id'):
+            try:
+                task_id = int(out['task_id'])
+                break
+            except (TypeError, ValueError):
+                continue
+    if task_id is None:
+        try:
+            task_id = int(str((context.get('task') or {}).get('id')))
+        except (TypeError, ValueError):
+            task_id = None
+    if task_id is None:
+        return False, 'no task id to find a review for'
+
+    deadline = wait_sec
+    poll = 6
+    waited = 0
+    while True:
+        # IMPORTANT: query with a FRESH session each poll. run_flow's main `db`
+        # holds a long-open REPEATABLE READ transaction whose snapshot predates
+        # the async auto-review row (it commits in a separate session right
+        # after the PR opens). Re-querying that stale snapshot would never
+        # observe the review reaching 'completed' → the gate would poll the
+        # full deadline and wrongly fall through to a human gate. A new session
+        # per poll gets a fresh snapshot and sees the committed review.
+        async with SessionLocal() as poll_db:
+            row = (await poll_db.execute(
+                select(TaskReview)
+                .where(TaskReview.task_id == task_id, TaskReview.organization_id == organization_id)
+                .order_by(TaskReview.id.desc())
+            )).scalars().first()
+            status = str(row.status) if row is not None else None
+            score = int(row.score) if (row is not None and row.score is not None) else -1
+            sev = str(row.severity or '').strip().lower() if row is not None else ''
+        if status in ('completed', 'failed'):
+            if status == 'failed':
+                return False, 'review failed'
+            sev_rank = _SEVERITY_RANK.get(sev, 9)
+            if score >= min_score and sev_rank <= max_rank:
+                return True, f'score {score} ≥ {min_score}, severity {sev or "clean"} ≤ {max_sev}'
+            return False, f'score {score} / severity {sev or "?"} below bar (need ≥{min_score}, ≤{max_sev})'
+        if waited >= deadline:
+            return False, f'review not finished within {deadline}s'
+        await _asyncio.sleep(poll)
+        waited += poll
+
+
 async def run_flow(
     flow: dict[str, Any],
     task: dict[str, Any],
@@ -2231,18 +2306,42 @@ async def run_flow(
     # task_id, so only keep it for logging when the record actually exists —
     # otherwise the first _flow_log would blow up the whole run with an
     # IntegrityError.
-    task_id: int | None = task.get('id')
+    # Materialize the visible TaskRecord up front via the SAME idempotent,
+    # dedup-aware resolver the developer node uses (`_resolve_or_create_task_id`)
+    # so the Tasks screen shows the task "analyzing" the instant Run Flow is
+    # pressed — instead of staying blank for ~60s until the developer node
+    # creates it. The developer node calls the same resolver later and matches
+    # this record by (org, source, external_id), so NO duplicate is created and
+    # the code pipeline is NOT triggered early (only the row is inserted).
+    # flow_run.task_id keeps the EXTERNAL id (the DevOps board's WI anchor); the
+    # internal record id is used only for AgentLog/boss-mode logging + status.
+    task_id: int | None = None
     task_record: TaskRecord | None = None
-    if task_id:
+    resolved_id: int | None = None
+    try:
+        resolved_id = await _resolve_or_create_task_id(
+            task=task, context=context, db=db,
+            organization_id=organization_id, create_if_missing=True,
+        )
+    except Exception:
+        logger.exception('Early task materialization failed for flow run %s', flow_run.id)
+        resolved_id = None
+    if resolved_id is None:
+        # Fallback to prior behavior: only log when task['id'] is a real record.
         try:
-            task_record = await db.get(TaskRecord, int(str(task_id)))
+            resolved_id = int(str(task.get('id')))
+        except (TypeError, ValueError):
+            resolved_id = None
+    if resolved_id is not None:
+        try:
+            task_record = await db.get(TaskRecord, resolved_id)
         except (TypeError, ValueError):
             task_record = None
-        if task_record:
+    if task_record is not None:
+        task_id = int(task_record.id)
+        if str(task_record.status) not in ('completed', 'merged', 'cancelled'):
             task_record.status = 'running'
-            await db.flush()
-        else:
-            task_id = None
+        await db.flush()
 
     # Role → boss-mode log message mapping (triggers correct animations)
     _ROLE_START_MSG: dict[str, str] = {
@@ -2320,6 +2419,20 @@ async def run_flow(
         # input_json so the resume survives Redis TTL/flush and worker
         # restarts (DB is the source of truth).
         gate_approved = prior is not None and prior.status == 'approved'
+        # Conditional auto-approval: when the gate is configured with
+        # `auto_approve_if_review_clean`, skip the human pause iff the AI
+        # review for this run's PR is clean (score/severity within bounds).
+        # Anything short of "clean" (low score, severity too high, or no
+        # finished review yet) falls through to a normal human gate — the
+        # safe default.
+        if (node.get('waitForApproval') and not gate_approved
+                and _bool_val(node.get('auto_approve_if_review_clean'), False)):
+            ok, why = await _evaluate_review_gate(db, node, context, organization_id)
+            if ok:
+                await _flow_log('agent', f'Auto-approved (review clean): {why}')
+                gate_approved = True  # proceed without pausing
+            else:
+                await _flow_log('agent', f'Auto-approve declined → human gate: {why}')
         if node.get('waitForApproval') and not gate_approved:
             gate_step = FlowRunStep(
                 run_id=flow_run.id,

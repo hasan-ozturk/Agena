@@ -184,6 +184,14 @@ function isRagLog(log: { stage: string; message: string }): boolean {
   );
 }
 
+// Backend serializes naive UTC datetimes without a 'Z' suffix, so the browser
+// treats them as local time and renders them ~hours off. Append 'Z' when no
+// timezone marker is present so new Date() interprets the value as UTC.
+function utcZ(s?: string | null): string {
+  if (!s) return '';
+  return /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z';
+}
+
 function indexingProgress(logs: { stage: string; message: string; created_at?: string }[]): { active: boolean; done: number; total: number } | null {
   for (let i = logs.length - 1; i >= 0; i -= 1) {
     const l = logs[i];
@@ -1120,7 +1128,7 @@ export default function TaskDetailPage() {
                       </div>
                     )}
                     <div style={{ marginTop: 4, fontSize: 10, color: 'var(--ink-35)' }}>
-                      {new Date(rev.created_at).toLocaleString()}
+                      {new Date(utcZ(rev.created_at)).toLocaleString()}
                     </div>
                   </div>
                 </div>
@@ -1149,7 +1157,7 @@ export default function TaskDetailPage() {
             const statusColor = hasAnswer ? '#a78bfa' : hasCompleted ? '#22c55e' : hasFailed ? '#f87171' : isRunning ? '#38bdf8' : '#94a3b8';
             const runRecord = runs[idx];
             const runTime = runLogs[0]?.created_at
-              ? new Date(runLogs[0].created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+              ? new Date(utcZ(runLogs[0].created_at)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
               : '';
             const metric = runRecord?.usage_total_tokens
               ? `${Math.round(runRecord.usage_total_tokens).toLocaleString()} tok`
@@ -1234,7 +1242,7 @@ export default function TaskDetailPage() {
         }
 
         if (latestLog) {
-          items.push({ label: t('taskDetail.lastUpdate'), value: new Date(latestLog.created_at).toLocaleTimeString() });
+          items.push({ label: t('taskDetail.lastUpdate'), value: new Date(utcZ(latestLog.created_at)).toLocaleTimeString() });
         }
 
         // Source work-item link (Azure / Jira) — gives the user a one-
@@ -1638,7 +1646,7 @@ export default function TaskDetailPage() {
                 </div>
               )}
               <div style={{ display: 'grid', gap: 7, marginBottom: 12 }}>
-                <div style={{ fontSize: 12, color: 'var(--ink-45)' }}>{t('taskDetail.created')}: {new Date(task.created_at).toLocaleString()}</div>
+                <div style={{ fontSize: 12, color: 'var(--ink-45)' }}>{t('taskDetail.created')}: {new Date(utcZ(task.created_at)).toLocaleString()}</div>
                 {metrics?.startedAt ? <div style={{ fontSize: 12, color: 'var(--ink-45)' }}>{t('taskDetail.runStart')}: {new Date(metrics.startedAt).toLocaleString()}</div> : null}
                 {metrics?.finishedAt ? <div style={{ fontSize: 12, color: 'var(--ink-45)' }}>{t('taskDetail.runEnd')}: {new Date(metrics.finishedAt).toLocaleString()}</div> : null}
               </div>
@@ -2038,7 +2046,7 @@ export default function TaskDetailPage() {
                   const isRag = isRagLog(log);
                   const color = isRag ? '#a78bfa' : stageColor(log.stage);
                   const stageLabel = isRag ? 'RAG' : log.stage;
-                  const ts = new Date(log.created_at).toLocaleTimeString();
+                  const ts = new Date(utcZ(log.created_at)).toLocaleTimeString();
                   return (
                     <div key={`${log.id || idx}-term`} style={{
                       marginBottom: 2,
@@ -2115,7 +2123,7 @@ export default function TaskDetailPage() {
                         {r.severity && <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4, background: `${sevColor}1f`, color: sevColor, textTransform: 'uppercase' }}>{r.severity}</span>}
                         {r.findings_count != null && <span style={{ fontSize: 11, color: 'var(--ink-50)' }}>{r.findings_count} findings</span>}
                         {r.score != null && <span style={{ fontSize: 11, color: 'var(--ink-50)' }}>score: {r.score}</span>}
-                        <span style={{ fontSize: 11, color: 'var(--ink-35)', marginLeft: 'auto' }}>#{r.id} · {new Date(r.created_at).toLocaleString()}</span>
+                        <span style={{ fontSize: 11, color: 'var(--ink-35)', marginLeft: 'auto' }}>#{r.id} · {new Date(utcZ(r.created_at)).toLocaleString()}</span>
                       </summary>
                       {r.output && (
                         <pre style={{ margin: '10px 0 0 0', fontSize: 12, fontFamily: 'inherit', color: 'var(--ink-78)', background: 'var(--panel)', padding: '12px 14px', borderRadius: 8, whiteSpace: 'pre-wrap', maxHeight: 480, overflowY: 'auto', lineHeight: 1.55 }}>{r.output}</pre>
@@ -2177,7 +2185,7 @@ export default function TaskDetailPage() {
                   <div key={step} style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '110px 1fr auto', gap: isMobile ? 4 : 10, alignItems: isMobile ? 'flex-start' : 'center', border: '1px solid var(--panel-border)', borderRadius: 10, padding: '8px 10px' }}>
                     <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', color }}>{step}</span>
                     <span style={{ fontSize: 12, color: 'var(--ink-72)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item?.message || t('taskDetail.pending')}</span>
-                    <span style={{ fontSize: 11, color: 'var(--ink-42)' }}>{item ? new Date(item.created_at).toLocaleTimeString() : '—'}</span>
+                    <span style={{ fontSize: 11, color: 'var(--ink-42)' }}>{item ? new Date(utcZ(item.created_at)).toLocaleTimeString() : '—'}</span>
                   </div>
                 );
               })}
@@ -2283,7 +2291,7 @@ export default function TaskDetailPage() {
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
                 <h3 style={{ margin: 0, color: 'var(--ink-90)', fontSize: 15 }}>{t('taskDetail.liveLogs')}</h3>
                 <span style={{ fontSize: 12, color: 'var(--ink-42)' }}>
-                  {latestLog ? `${latestLog.stage} • ${new Date(latestLog.created_at).toLocaleTimeString()}` : ''}
+                  {latestLog ? `${latestLog.stage} • ${new Date(utcZ(latestLog.created_at)).toLocaleTimeString()}` : ''}
                 </span>
               </div>
               <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
@@ -2332,7 +2340,7 @@ export default function TaskDetailPage() {
                       <div key={`${log.created_at}-${idx}-history`} style={{ borderRadius: 10, border: '1px solid var(--panel-border-2)', background: 'var(--panel)', padding: '9px 10px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 6 }}>
                           <span style={{ fontSize: 10, fontWeight: 700, color, textTransform: 'uppercase', letterSpacing: 0.8 }}>{log.stage}</span>
-                          <span style={{ fontSize: 11, color: 'var(--ink-35)', whiteSpace: 'nowrap' }}>{new Date(log.created_at).toLocaleString()}</span>
+                          <span style={{ fontSize: 11, color: 'var(--ink-35)', whiteSpace: 'nowrap' }}>{new Date(utcZ(log.created_at)).toLocaleString()}</span>
                         </div>
                         <div style={{ fontSize: 12, color: 'var(--ink-78)', lineHeight: 1.45, whiteSpace: log.stage === 'code_preview' || log.stage === 'code_diff' ? 'pre-wrap' : 'normal', fontFamily: log.stage === 'code_preview' || log.stage === 'code_diff' ? 'ui-monospace, SFMono-Regular, Menlo, monospace' : 'inherit', overflowX: log.stage === 'code_preview' || log.stage === 'code_diff' ? 'auto' : 'visible' }}>
                           {log.message}
