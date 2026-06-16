@@ -206,6 +206,11 @@ async def run_flow_endpoint(
     db.add(flow_run)
     await db.flush()
     flow_run_id = int(flow_run.id)
+    # COMMIT BEFORE ENQUEUE: the worker runs on a separate DB session and
+    # dequeues near-instantly. If we enqueue before committing, the worker can
+    # query FlowRun(id) before this transaction lands → "FlowRun N not found for
+    # resume". Committing first guarantees the row is durably visible.
+    await db.commit()
 
     qs = QueueService()
     # Flow def for the worker (keyed by internal task id) — snapshot on the row
@@ -225,7 +230,6 @@ async def run_flow_endpoint(
         'flow_run_id': flow_run_id,
         'create_pr': True,
     })
-    await db.commit()
 
     run_result = await db.execute(
         select(FlowRun)
