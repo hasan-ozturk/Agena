@@ -485,7 +485,11 @@ class OrchestrationService:
                     )
                     parsed_blocks = self._parse_reviewed_output_to_files(final_code, local_repo_path=routing.local_repo_path)
                     if not parsed_blocks:
-                        git_changes = await self._collect_git_changes(routing.local_repo_path)
+                        # Same as claude_cli: codex edits in its worktree, so collect
+                        # the diff from there (not the main checkout) to avoid a
+                        # false-empty retry that discards the agent's work.
+                        _cdx_wt = getattr(getattr(self, 'codex_cli_service', None), 'last_effective_path', None) or routing.local_repo_path
+                        git_changes = await self._collect_git_changes(_cdx_wt)
                         if not git_changes:
                             await task_service.add_log(
                                 task.id,
@@ -593,7 +597,14 @@ class OrchestrationService:
                     )
                     parsed_blocks = self._parse_reviewed_output_to_files(final_code, local_repo_path=routing.local_repo_path)
                     if not parsed_blocks:
-                        git_changes = await self._collect_git_changes(routing.local_repo_path)
+                        # claude_cli edits files DIRECTLY in its worktree (agentic
+                        # tool mode → no file blocks in the text output). Collect the
+                        # diff from the WORKTREE, not the main checkout — otherwise
+                        # this always reports "empty" and triggers a wasteful retry
+                        # that recreates the worktree and DISCARDS the agent's real
+                        # edits (root cause of "PR has stale/unrelated change").
+                        _cli_wt = getattr(self.claude_cli_service, 'last_effective_path', None) or routing.local_repo_path
+                        git_changes = await self._collect_git_changes(_cli_wt)
                         if not git_changes:
                             await task_service.add_log(
                                 task.id,
