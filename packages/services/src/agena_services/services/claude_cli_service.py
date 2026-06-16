@@ -251,6 +251,24 @@ class ClaudeCLIService:
         self.last_worktree_path = wt_path
         self.last_effective_path = effective_path
 
+        # Surface whether a repo guide (CLAUDE.md/AGENTS.md) is present in the
+        # worktree base, so the user can confirm from the task Activity/Logs feed
+        # whether their committed guide is actually picked up by this run.
+        # (Claude reads CLAUDE.md natively, but it only exists in the worktree if
+        # it was committed to the base branch the worktree was cut from.)
+        if log_callback:
+            import os as _os
+            _guide = next((g for g in ('CLAUDE.md', 'agents.md', 'AGENTS.md')
+                           if _os.path.isfile(_os.path.join(effective_path, g))), None)
+            if _guide:
+                try:
+                    _sz = _os.path.getsize(_os.path.join(effective_path, _guide))
+                except OSError:
+                    _sz = 0
+                await log_callback(f'Repo guide: {_guide} present in worktree ({_sz} chars) — Claude reads it natively')
+            else:
+                await log_callback('Repo guide: no CLAUDE.md/AGENTS.md in worktree — commit one to the base branch to guide the agent')
+
         try:
             claude_bin = shutil.which('claude')
             if claude_bin:

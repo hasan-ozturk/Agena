@@ -1848,8 +1848,11 @@ function DetailPanel({ item, onClose, project, integrations, aiLoading, aiResult
         <button onClick={onClose} style={{ width: 26, height: 26, borderRadius: '50%', border: '1px solid var(--panel-border-3)', background: 'var(--panel-alt)', color: 'var(--ink-35)', cursor: 'pointer', fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>×</button>
       </div>
 
-      {/* Body */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '14px 18px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {/* Body — 2 columns: left = work-item context, right = AI assign settings.
+          Collapses to 1 column on narrow widths via auto-fit/minmax. */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: 20, alignItems: 'start' }}>
+        {/* LEFT: work-item context */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
         <DetailRow icon={<NavIcon name="user-check" size={14} />} label={t('sprints.assignee')}>{item.assigned_to || '—'}</DetailRow>
 
         {item.created_date && (
@@ -1863,11 +1866,11 @@ function DetailPanel({ item, onClose, project, integrations, aiLoading, aiResult
 
         <div>
           <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--ink-25)', marginBottom: 6 }}>{t('sprints.description')}</div>
-          <div style={{ fontSize: 12, color: 'var(--ink-50)', lineHeight: 1.6, background: 'var(--panel-alt)', borderRadius: 8, padding: '10px 12px', border: '1px solid var(--panel-border)' }}>
+          <div style={{ fontSize: 12, color: 'var(--ink-50)', lineHeight: 1.6, background: 'var(--panel-alt)', borderRadius: 8, padding: '10px 12px', border: '1px solid var(--panel-border)', overflow: 'hidden' }}>
             {(item.description || '').trim() ? (
               <RichDescription
                 html={item.description}
-                style={{ whiteSpace: 'normal', overflowWrap: 'anywhere' }}
+                style={{ whiteSpace: 'normal', overflowWrap: 'anywhere', maxWidth: '100%' }}
               />
             ) : (
               plainDescription || t('sprints.noDescriptionFound')
@@ -1928,9 +1931,13 @@ function DetailPanel({ item, onClose, project, integrations, aiLoading, aiResult
           )}
         </div>
 
+        </div>{/* /LEFT column */}
+
+        {/* RIGHT: AI assign settings */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 }}>
         {/* ── AI Ayarları ── */}
-        <div style={{ borderTop: '1px solid var(--panel-border)', paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--ink-25)' }}>{t('sprints.aiAssignSettings')}</div>
+        <div style={{ borderRadius: 12, border: '1px solid var(--panel-border)', background: 'var(--panel-alt)', padding: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--ink-45)', display: 'flex', alignItems: 'center', gap: 6 }}><NavIcon name="zap" size={13} /> {t('sprints.aiAssignSettings')}</div>
 
           {/* Repo Source */}
           <div>
@@ -2023,8 +2030,8 @@ function DetailPanel({ item, onClose, project, integrations, aiLoading, aiResult
 
         {/* ── Flow Çalıştır ── */}
         {savedFlows.length > 0 && (
-          <div style={{ borderTop: '1px solid var(--panel-border)', paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--ink-25)' }}>{t('sprints.runFlow')}</div>
+          <div style={{ borderRadius: 12, border: '1px solid var(--panel-border)', background: 'var(--panel-alt)', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--ink-45)', display: 'flex', alignItems: 'center', gap: 6 }}><NavIcon name="flows" size={13} /> {t('sprints.runFlow')}</div>
             <select value={selFlow} onChange={(e) => setSelFlow(e.target.value)} style={dpSelectStyle}>
               <option value="" style={{ background: 'var(--surface)' }}>{t('sprints.selectFlow')}</option>
               {savedFlows.map((f) => <option key={f.id} value={f.id} style={{ background: 'var(--surface)' }}>{f.name}</option>)}
@@ -2044,13 +2051,15 @@ function DetailPanel({ item, onClose, project, integrations, aiLoading, aiResult
             )}
           </div>
         )}
+        </div>{/* /RIGHT column */}
       </div>
 
-      {/* Footer */}
-      <div style={{ padding: '12px 18px', borderTop: '1px solid var(--panel-border)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {/* Footer — actions in a horizontal row (wraps on narrow widths) */}
+      <div style={{ padding: '14px 20px', borderTop: '1px solid var(--panel-border)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         {savedFlows.length > 0 && (
           <button onClick={() => selFlow && onRunFlow(selFlow, { project: selectedLocalMapping?.azure_project || project || undefined, azureRepo: selectedLocalMapping?.azure_repo_url || undefined, localRepoMapping: selectedLocalMapping?.name || undefined, localRepoPath: selectedLocalMapping?.local_path || undefined, repoPlaybook: selectedLocalMapping?.repo_playbook || undefined, executionPrompt: executionPrompt.trim() || undefined })} disabled={flowRunning || !selFlow}
-            style={{ width: '100%', padding: '10px', borderRadius: 10, border: 'none', background: flowRunning ? 'var(--acc-soft)' : selFlow ? 'var(--acc)' : 'var(--panel-border)', color: selFlow ? '#fff' : 'var(--ink-30)', fontWeight: 700, fontSize: 13, cursor: flowRunning || !selFlow ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+            style={{ flex: '1 1 160px', padding: '11px 12px', borderRadius: 10, border: 'none', background: flowRunning ? 'var(--acc-soft)' : selFlow ? 'var(--acc)' : 'var(--panel-border)', color: selFlow ? '#fff' : 'var(--ink-30)', fontWeight: 700, fontSize: 13, cursor: flowRunning || !selFlow ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
             {flowRunning ? <><span style={{ fontSize: 14 }}>⟳</span> {t('sprints.flowRunning')}</> : <><span style={{ fontSize: 14 }}>▶</span> {selFlow ? t('sprints.runFlow') : t('sprints.selectFlow')}</>}
           </button>
         )}
@@ -2058,16 +2067,17 @@ function DetailPanel({ item, onClose, project, integrations, aiLoading, aiResult
           const remoteM = repoSource === 'remote' && remoteRepoSel ? remoteRepoSel.meta : undefined;
           onAssignAI({ project: selectedLocalMapping?.azure_project || remoteRepoSel?.project, azureRepo: selectedLocalMapping?.azure_repo_url || remoteRepoSel?.repoUrl, localRepoMapping: repoSource === 'mapping' ? selectedLocalMapping?.name : undefined, localRepoPath: repoSource === 'mapping' ? selectedLocalMapping?.local_path : undefined, repoPlaybook: selectedLocalMapping?.repo_playbook, mode: 'mcp_agent', executionPrompt: executionPrompt.trim() || undefined, createPr: true, ...(remoteM ? { remoteRepo: remoteM } : {}) });
         }} disabled={aiLoading || (repoSource === 'mapping' ? !selectedLocalMapping : !remoteRepoSel)}
-          style={{ width: '100%', padding: '11px', borderRadius: 10, border: 'none', background: aiLoading ? 'var(--acc-soft)' : (repoSource === 'mapping' ? selectedLocalMapping : remoteRepoSel) ? 'var(--acc)' : 'var(--panel-border)', color: (repoSource === 'mapping' ? selectedLocalMapping : remoteRepoSel) ? '#fff' : 'var(--ink-30)', fontWeight: 700, fontSize: 13, cursor: aiLoading ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          style={{ flex: '1 1 160px', padding: '11px 12px', borderRadius: 10, border: 'none', background: aiLoading ? 'var(--acc-soft)' : (repoSource === 'mapping' ? selectedLocalMapping : remoteRepoSel) ? 'var(--acc)' : 'var(--panel-border)', color: (repoSource === 'mapping' ? selectedLocalMapping : remoteRepoSel) ? '#fff' : 'var(--ink-30)', fontWeight: 700, fontSize: 13, cursor: aiLoading ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
           {aiLoading ? <><span style={{ fontSize: 14 }}>⟳</span> {t('sprints.aiRunning')}</> : <><NavIcon name="zap" size={14} /> {(repoSource === 'mapping' ? selectedLocalMapping : remoteRepoSel) ? t('tasks.assignMcp' as TranslationKey) : t('sprints.selectMappingShort')}</>}
         </button>
         <button onClick={() => {
           const remoteM = repoSource === 'remote' && remoteRepoSel ? remoteRepoSel.meta : undefined;
           onAssignAI({ project: selectedLocalMapping?.azure_project || remoteRepoSel?.project, azureRepo: selectedLocalMapping?.azure_repo_url || remoteRepoSel?.repoUrl, localRepoMapping: repoSource === 'mapping' ? selectedLocalMapping?.name : undefined, localRepoPath: repoSource === 'mapping' ? selectedLocalMapping?.local_path : undefined, repoPlaybook: selectedLocalMapping?.repo_playbook, agentRole: selAgent || undefined, agentProvider: selectedAgent?.provider, agentModel: selectedAgent?.custom_model || selectedAgent?.model, executionPrompt: executionPrompt.trim() || undefined, createPr: selectedAgent?.create_pr ?? true, ...(remoteM ? { remoteRepo: remoteM } : {}) });
         }} disabled={aiLoading || !selAgent || (repoSource === 'mapping' ? !selectedLocalMapping : !remoteRepoSel)}
-          style={{ width: '100%', padding: '11px', borderRadius: 10, border: 'none', background: aiLoading ? 'var(--acc-soft)' : selAgent ? 'var(--acc)' : 'var(--panel-border)', color: selAgent ? '#fff' : 'var(--ink-30)', fontWeight: 700, fontSize: 13, cursor: aiLoading || !selAgent ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          style={{ flex: '1 1 160px', padding: '11px 12px', borderRadius: 10, border: 'none', background: aiLoading ? 'var(--acc-soft)' : selAgent ? 'var(--acc)' : 'var(--panel-border)', color: selAgent ? '#fff' : 'var(--ink-30)', fontWeight: 700, fontSize: 13, cursor: aiLoading || !selAgent ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
           {aiLoading ? <><span style={{ fontSize: 14 }}>⟳</span> {t('sprints.aiRunning')}</> : <><NavIcon name="agents" size={14} /> {selAgent ? ((repoSource === 'mapping' ? selectedLocalMapping : remoteRepoSel) ? t('sprints.assignAi') : t('sprints.selectMappingShort')) : t('sprints.selectAgent')}</>}
         </button>
+        </div>{/* /button row */}
         <div style={{ fontSize: 10, color: 'var(--ink-25)', textAlign: 'center' }}>{t('sprints.aiHint')}</div>
       </div>
     </div>

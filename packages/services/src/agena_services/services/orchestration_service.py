@@ -784,6 +784,14 @@ class OrchestrationService:
                 elif _is_remote:
                     _mcp_agents_md = await self._fetch_remote_agents_md(routing.remote_repo, organization_id)
 
+                # Surface repo-guide presence in the task Activity/Logs feed.
+                if _mcp_agents_md:
+                    await task_service.add_log(task.id, organization_id, 'agent',
+                        f'Repo guide loaded (CLAUDE.md/AGENTS.md): {len(_mcp_agents_md)} chars')
+                elif _is_local:
+                    await task_service.add_log(task.id, organization_id, 'agent',
+                        'Repo guide: no CLAUDE.md/AGENTS.md in worktree — commit one to the base branch to guide the agent')
+
                 # Optional: load custom system prompt from Prompt Studio
                 _mcp_custom_prompt: str | None = None
                 try:

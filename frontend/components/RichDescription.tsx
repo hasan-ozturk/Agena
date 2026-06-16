@@ -41,6 +41,10 @@ export default function RichDescription({
     let cancelled = false;
     const imgs = Array.from(ref.current.querySelectorAll('img'));
     imgs.forEach((img) => {
+      // Constrain every embedded image to its container so big screenshots
+      // (e.g. pasted Azure/Jira attachments) never overflow the layout.
+      img.style.maxWidth = '100%';
+      img.style.height = 'auto';
       const src = img.getAttribute('src') || '';
       if (!AUTH_IMAGE_HOST_RE.test(src)) return;
       // Already proxied this source — re-apply instantly (no flicker, no refetch).
